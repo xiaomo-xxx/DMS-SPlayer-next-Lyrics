@@ -1,0 +1,13 @@
+{
+    "id": "liveLyrics",
+    "name": "DMS SPlayer Lyrics",
+    "description": "Display synced lyrics from SPlayer on your DankBar",
+    "version": "2.0.0",
+    "author": "imsyy",
+    "icon": "lyrics",
+    "type": "widget",
+    "component": "./LiveLyrics.qml",
+    "settings": "./LiveLyricsSettings.qml",
+    "capabilities": ["dankbar-widget"],
+    "permissions": ["settings_read", "settings_write", "process", "network"]
+}
