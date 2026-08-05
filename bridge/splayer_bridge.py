@@ -90,6 +90,15 @@ async def run(host, port):
                     "type": "__status",
                     "data": {"connected": True, "host": host, "port": port},
                 })
+
+                # 连接成功后主动请求当前状态（SPlayer 不重放事件，
+                # 重启 DMS/bridge 后需靠此恢复歌曲信息与进度）
+                try:
+                    await ws.send(json.dumps({"type": "get-song-info"}))
+                    log("已发送 get-song-info")
+                except websockets.WebSocketException as exc:
+                    log(f"发送 get-song-info 失败: {exc}")
+
                 while await consume(ws):
                     pass
                 log("连接已断开")

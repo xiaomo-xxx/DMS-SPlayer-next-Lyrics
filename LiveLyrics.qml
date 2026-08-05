@@ -217,12 +217,62 @@ PluginComponent {
             return
         switch (data.type) {
         case "song-change":     root._onSongChange(data.data || {});      break
+        case "song-info":       root._onSongInfo(data.data || {});        break
         case "lyric-change":    root._onLyricChange(data.data || {});     break
         case "progress-change": root._onProgressChange(data.data || {});  break
         case "status-change":   root._onStatusChange(data.data || {});    break
         default:
             break
         }
+    }
+
+    // song-info：连接后 bridge 主动请求的当前状态快照（SPlayer 不重放事件，
+    // 重启 DMS/bridge 后靠它恢复歌曲信息、进度、播放状态与歌词）
+    // 实测：响应含 lrcData/yrcData（文档确认），可完整恢复
+    function _onSongInfo(d) {
+        if (!d)
+            return
+        var title = d.playName || d.name || d.title || ""
+        var artist = d.artistName || d.artist || ""
+        var album = d.albumName || d.album || ""
+
+        // 与 song-change 相同的同曲判断：避免覆盖已有歌词状态
+        var sameTrack = root.currentTitle === title && root.currentArtist === artist
+
+        root.currentTitle = title
+        root.currentSongName = d.name || title
+        root.currentArtist = artist
+        root.currentAlbum = album
+        if (d.duration > 0)
+            root.currentDuration = d.duration
+
+        if (!sameTrack) {
+            // 恢复期间未听过此歌：清空歌词等待推送
+            root.lyricsLines = []
+            root.currentLineIndex = -1
+            root.currentWordIndex = -1
+            console.info("[LiveLyrics] 📡 状态恢复: \"" + title + "\" — " + artist)
+        }
+
+        // 恢复歌词（song-info 实测含 lrcData/yrcData）
+        var hasLyricData = (Array.isArray(d.lrcData) && d.lrcData.length > 0)
+            || (Array.isArray(d.yrcData) && d.yrcData.length > 0)
+        if (hasLyricData && !sameTrack) {
+            root._onLyricChange({ lrcData: d.lrcData, yrcData: d.yrcData })
+            console.info("[LiveLyrics] 📡 歌词恢复: " + root.lyricsLines.length + " 行")
+        }
+
+        // 恢复播放进度（currentTime 为毫秒）
+        if (typeof d.currentTime === "number" && d.currentTime >= 0) {
+            root.currentTime = d.currentTime
+            root._lastReportedTime = d.currentTime
+            root._lastProgressAt = d.playStatus === true ? Date.now() : 0
+            root._updateCurrentLine()
+        }
+
+        // 恢复播放状态
+        if (d.playStatus !== undefined)
+            root._onStatusChange({ status: d.playStatus === true })
     }
 
     function _onSongChange(d) {
@@ -531,6 +581,26 @@ PluginComponent {
             return
         player.position = startMs / 1000
         console.info("[LiveLyrics] ⏩ 跳转到歌词行 " + index + " (" + root._fmtTime(startMs) + ")")
+    }
+
+    // 退出 SPlayer（终止全部相关进程；Bar 组件会经 visibilityCommand 自动隐藏）
+    // SPlayer 是 Electron 应用，除主进程外还有 zygote/gpu/renderer 等子进程
+    // （命令行均含 /opt/SPlayer/SPlayer），需 -f 匹配全部；先 SIGTERM 优雅退出，
+    // 2 秒后未退干净则 SIGKILL 兜底，避免托盘残留
+    function quitSPlayer() {
+        console.info("[LiveLyrics] ⏻ 退出 SPlayer")
+        Quickshell.execDetached(["pkill", "-f", "^/opt/SPlayer/SPlayer"])
+        quitKillTimer.restart()
+    }
+
+    // 兜底：SIGTERM 后 2 秒仍未退出 → SIGKILL
+    Timer {
+        id: quitKillTimer
+        interval: 2000
+        repeat: false
+        onTriggered: {
+            Quickshell.execDetached(["pkill", "-9", "-f", "^/opt/SPlayer/SPlayer"])
+        }
     }
 
     function _fmtTime(ms) {
@@ -847,6 +917,31 @@ PluginComponent {
                             color: nextBtn.containsMouse ? Theme.primary : Theme.surfaceText
                         }
                     }
+
+                    // 退出 SPlayer（电源按钮：红色 hover 警示，参照关闭按钮风格）
+                    Rectangle {
+                        width: 32
+                        height: 32
+                        radius: 16
+                        color: powerBtn.containsMouse
+                            ? Theme.withAlpha(Theme.error, 0.15)
+                            : "transparent"
+
+                        MouseArea {
+                            id: powerBtn
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.quitSPlayer()
+                        }
+
+                        DankIcon {
+                            anchors.centerIn: parent
+                            name: "power_settings_new"
+                            size: Theme.iconSize - 4
+                            color: powerBtn.containsMouse ? Theme.error : Theme.surfaceText
+                        }
+                    }
                 }
             }
 
@@ -1089,13 +1184,29 @@ PluginComponent {
                 }
 
                 // ── 歌词预览：当前行 + 上下文 ──
-                StyledText {
-                    text: "歌词"
-                    // 与上方 SPlayer 主/副标题对齐（PopoutComponent 的 leftPadding: Theme.spacingS）
+                // 标题行：歌词图标 + "歌词"（与上方 SPlayer 标题对齐）
+                // 图标尺寸与作者/专辑行一致（14px），并用 y 微调垂直居中，
+                // 避免图标因字形基线差异显得略高
+                Row {
+                    width: parent.width
                     leftPadding: Theme.spacingS
-                    font.pixelSize: Theme.fontSizeSmall
-                    font.weight: Font.DemiBold
-                    color: Theme.surfaceVariantText
+                    spacing: Theme.spacingXS
+
+                    DankIcon {
+                        name: "lyrics"
+                        size: 14
+                        color: Theme.surfaceVariantText
+                        anchors.verticalCenter: parent.verticalCenter
+                        y: 4   // 微调：与文字视觉居中对齐（图标字形偏高，下移补偿）
+                    }
+
+                    StyledText {
+                        text: "歌词"
+                        font.pixelSize: Theme.fontSizeSmall
+                        font.weight: Font.DemiBold
+                        color: Theme.surfaceVariantText
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
                 }
 
                 Rectangle {
@@ -1160,12 +1271,14 @@ PluginComponent {
 
                             // 每行三行结构：原文（大）→ 中文翻译（较小）→ 罗马音（最小）
                             // 四边 padding：文字与高亮条（圆角矩形）边缘留出间距，
-                            // 确保文字被高亮区域完整包裹
+                            // 确保文字被高亮区域完整包裹。
+                            // 右侧 padding 略大于左侧：富文本/滚动条在右侧留白，
+                            // 使左右视觉边距均衡
                             Column {
                                 id: lyricRow
                                 width: parent.width
                                 leftPadding: Theme.spacingM
-                                rightPadding: Theme.spacingM
+                                rightPadding: Theme.spacingM + Theme.spacingXS
                                 topPadding: Theme.spacingS
                                 bottomPadding: Theme.spacingS
                                 spacing: 4
