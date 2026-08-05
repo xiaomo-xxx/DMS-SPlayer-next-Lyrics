@@ -74,9 +74,49 @@ async def consume(ws):
     return True
 
 
+# 当前 WebSocket 连接（供 stdin 转发使用）
+_ws = None
+
+
+async def stdin_forwarder():
+    """读取 stdin 中的 JSON 行，转发给 SPlayer（控制命令通道）。
+
+    QML 侧通过 Process.write() 发送，例如：
+        {"type": "control", "data": {"command": "toggle"}}
+        {"type": "get-song-info"}
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            await asyncio.sleep(0.2)
+            continue
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            log(f"stdin 非 JSON，忽略: {line[:120]!r}")
+            continue
+        ws = _ws
+        if ws is None:
+            log("stdin 命令已收到，但未连接 SPlayer，忽略")
+            continue
+        try:
+            await ws.send(json.dumps(payload))
+            log(f"已转发命令: {payload.get('type')}")
+        except websockets.WebSocketException as exc:
+            log(f"转发命令失败: {exc}")
+
+
 async def run(host, port):
+    global _ws
     uri = f"ws://{host}:{port}"
     delay = RETRY_MIN
+
+    # 启动 stdin 转发任务
+    asyncio.get_running_loop().create_task(stdin_forwarder())
 
     while True:
         try:
@@ -84,6 +124,7 @@ async def run(host, port):
             # ping_interval=None: 不发送应用层 ping，
             # 避免 SPlayer 不响应协议 ping 时被误判断线。
             async with websockets.connect(uri, ping_interval=None) as ws:
+                _ws = ws
                 log("已连接")
                 delay = RETRY_MIN
                 emit({
@@ -105,6 +146,7 @@ async def run(host, port):
         except (websockets.WebSocketException, OSError) as exc:
             log(f"连接失败: {exc}")
 
+        _ws = None
         emit({"type": "__status", "data": {"connected": False}})
         log(f"{delay:.0f}s 后重连…")
         await asyncio.sleep(delay)

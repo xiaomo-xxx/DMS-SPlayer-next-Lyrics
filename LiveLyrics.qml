@@ -113,6 +113,7 @@ PluginComponent {
         id: bridgeProcess
         command: [root._pythonBin(), root.bridgeScript, root.splayerHost, root.splayerPort]
         running: false
+        stdinEnabled: true   // 允许向 bridge 发送控制命令（转发给 SPlayer）
         stdout: SplitParser {
             splitMarker: "\n"
             onRead: data => root._onBridgeLine(data)
@@ -132,6 +133,17 @@ PluginComponent {
                          + root._restartDelay + "s 后重启")
             root._scheduleRestart()
         }
+    }
+
+    // 通过 bridge 向 SPlayer 发送命令（stdin 通道）
+    // 用于 MPRIS 不可用时的控制回退：{"type":"control","data":{"command":"toggle"}}
+    function _wsCommand(command) {
+        if (!bridgeProcess.running) {
+            console.warn("[LiveLyrics] bridge 未运行，无法发送命令: " + command)
+            return
+        }
+        bridgeProcess.write(JSON.stringify({ type: "control", data: { command: command } }) + "\n")
+        console.info("[LiveLyrics] 📤 已发送 control/" + command)
     }
 
     function _scheduleRestart() {
@@ -236,8 +248,16 @@ PluginComponent {
         var artist = d.artistName || d.artist || ""
         var album = d.albumName || d.album || ""
 
-        // 与 song-change 相同的同曲判断：避免覆盖已有歌词状态
-        var sameTrack = root.currentTitle === title && root.currentArtist === artist
+        // 与 song-change 相同的宽容同曲判断：避免覆盖已有歌词状态
+        var curTitle = root.currentTitle
+        var sameTrack = false
+        if (curTitle === title && root.currentArtist === artist) {
+            sameTrack = true
+        } else if (title && title !== "" && curTitle.indexOf(title) >= 0) {
+            sameTrack = true
+        } else if (curTitle && curTitle !== "" && title.indexOf(curTitle) >= 0) {
+            sameTrack = true
+        }
 
         root.currentTitle = title
         root.currentSongName = d.name || title
@@ -279,20 +299,39 @@ PluginComponent {
         // 实测：SPlayer 的 title 为 "歌名 - 歌手" 组合格式，name 为纯歌名
         var title = d.title || d.name || ""
         var artist = d.artist || ""
-        // 实测：SPlayer 在「拖动进度条」和「单曲循环回退」时会重推同一首歌的
-        // song-change，但不会重推 lyric-change。若按新歌处理会清空歌词，
-        // 导致歌词丢失。因此只有真正换歌才清空歌词与进度。
-        var sameTrack = root.currentTitle === title && root.currentArtist === artist
+        var songName = d.name || ""
+        // 实测：SPlayer 在「拖动进度条」「seek 跳转」「单曲循环回退」时会重推
+        // 同一首歌的 song-change，但不会重推 lyric-change。若按新歌处理会清空
+        // 歌词，导致歌词丢失。因此只有真正换歌才清空歌词与进度。
+        //
+        // 同曲判断（宽容匹配）：
+        //   - title+artist 完全一致
+        //   - 或 name（纯歌名）一致 + 当前 title 包含该 name
+        //   - 或当前 title 与新 title 都包含相同 name（忽略 " - 歌手" 后缀差异）
+        var curTitle = root.currentTitle
+        var curArtist = root.currentArtist
+        var curName = root.currentSongName
+
+        var sameTrack = false
+        if (curTitle === title && curArtist === artist) {
+            sameTrack = true
+        } else if (songName && songName !== "" && curTitle.indexOf(songName) >= 0) {
+            // 新 song-change 带纯歌名，且当前标题包含该歌名 → 同曲
+            sameTrack = true
+        } else if (curName && curName !== "" && title.indexOf(curName) >= 0) {
+            // 当前有纯歌名，且新标题包含它 → 同曲
+            sameTrack = true
+        }
 
         root.currentTitle = title
-        root.currentSongName = d.name || ""
+        root.currentSongName = songName
         root.currentArtist = artist
         root.currentAlbum = d.album || ""
         root.currentDuration = d.duration > 0 ? d.duration : 0
 
         if (sameTrack) {
-            // 同曲重推（拖动/循环）：保留歌词与 currentTime，仅刷新时长
-            console.info("[LiveLyrics] ↻ 同曲重推 (拖动/循环): \"" + root.currentTitle + "\"")
+            // 同曲重推（拖动/循环/seek）：保留歌词与 currentTime，仅刷新时长
+            console.info("[LiveLyrics] ↻ 同曲重推 (拖动/循环/seek): \"" + root.currentTitle + "\"")
             root._updateCurrentLine()
         } else {
             // 真换歌：清空歌词，等待随后的 lyric-change
@@ -510,6 +549,61 @@ PluginComponent {
     // （SPlayer 的 WebSocket 不推送封面，封面只能从 MPRIS 获取）
     readonly property MprisPlayer mprisPlayer: MprisController.activePlayer
 
+    // MPRIS 是否"可用"：SPlayer 重启后 MPRIS D-Bus 名称变化（instance+PID），
+    // 旧 player 引用会失效但 DMS 可能未及时刷新 → 健康检查后置为 false，
+    // 使封面/控制/进度条整体隐藏（而非显示失效状态）
+    property bool mprisUsable: false
+
+    // MPRIS 健康检查：每 3 秒验证 activePlayer 是否仍有效，并主动寻找 SPlayer。
+    // SPlayer 重启后 MPRIS D-Bus 名称变化（instance+PID），Quickshell 的
+    // Mpris.players 模型更新可能不触发 DMS 的 availablePlayers 信号，
+    // 导致 activePlayer 停留在旧引用。因此这里：
+    //   1) 直接遍历 Mpris.players 找 identity 含 "splayer" 的 player
+    //   2) 若找到且与当前 activePlayer 不同 → 强制 MprisController.setActivePlayer()
+    //   3) 找不到 SPlayer 或读取异常 → mprisUsable = false（回退 WebSocket）
+    Timer {
+        id: mprisHealthTimer
+        interval: 3000
+        repeat: true
+        running: true
+        onTriggered: {
+            // 步骤 1：直接从 Quickshell 底层 players 找 SPlayer
+            var splayer = null
+            try {
+                var players = Mpris.players.values
+                for (var i = 0; i < players.length; i++) {
+                    var identity = (players[i].identity || "").toLowerCase()
+                    if (identity.indexOf("splayer") >= 0) {
+                        splayer = players[i]
+                        break
+                    }
+                }
+            } catch (e) {}
+
+            // 步骤 2：找到 SPlayer 且不是当前 activePlayer → 强制激活
+            if (splayer) {
+                if (root.mprisPlayer !== splayer) {
+                    console.info("[LiveLyrics] 🔄 MPRIS 重激活: " + splayer.identity)
+                    try {
+                        MprisController.setActivePlayer(splayer)
+                    } catch (e) {
+                        console.warn("[LiveLyrics] setActivePlayer 失败: " + e)
+                    }
+                }
+                root.mprisUsable = true
+                return
+            }
+
+            // 步骤 3：找不到 SPlayer 的 MPRIS（进程未注册或未启动）
+            if (root.mprisPlayer) {
+                // 当前有 activePlayer 但可能不是 SPlayer（如其他播放器）：
+                // 若当前播放的是 SPlayer 歌曲，回退 WebSocket 模式
+                console.warn("[LiveLyrics] MPRIS 中未找到 SPlayer，回退 WebSocket 模式")
+            }
+            root.mprisUsable = false
+        }
+    }
+
     // 纯歌名：优先 SPlayer 的 name 字段，否则回退到 title
     readonly property string displayTitle: root.currentSongName !== ""
         ? root.currentSongName
@@ -554,33 +648,53 @@ PluginComponent {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // 播放/暂停控制（通过 MPRIS，DMS 媒体控件同款 API）
-    // ─────────────────────────────────────────────────────────────────────
-
+    // 播放/暂停控制：优先 MPRIS，失效时回退 WebSocket control 命令
     function togglePlayPause() {
         var player = root.mprisPlayer
-        if (player && player.canTogglePlaying)
+        if (root.mprisUsable && player && player.canTogglePlaying) {
             player.togglePlaying()
-        else
-            console.warn("[LiveLyrics] MPRIS 播放器不可用，无法切换播放/暂停")
+            return
+        }
+        // MPRIS 不可用 → 通过 bridge 发 WebSocket 命令
+        root._wsCommand("toggle")
     }
 
     // 点击歌词行 → 将播放进度 seek 到该行开始处
-    // （通过 MPRIS position 写入，与 DMS 媒体控件 DankSeekbar 同款 API；
-    //   单位：秒。seek 后 SPlayer 会推送新的 progress-change 驱动歌词跳转）
+    // （优先 MPRIS position 写入；MPRIS 失效时回退 WebSocket：
+    //   SPlayer 协议无 seek 命令，通过 seek 命令无法实现，故仅提示）
     function seekToLine(index) {
         if (index < 0 || index >= root.lyricsLines.length)
             return
         var player = root.mprisPlayer
-        if (!player || !player.canSeek) {
-            console.warn("[LiveLyrics] MPRIS 播放器不支持 seek，无法跳转歌词")
+        if (root.mprisUsable && player && player.canSeek) {
+            var startMs = root.lyricsLines[index].startTime
+            if (startMs < 0)
+                return
+            player.position = startMs / 1000
+            console.info("[LiveLyrics] ⏩ 跳转到歌词行 " + index + " (" + root._fmtTime(startMs) + ")")
             return
         }
-        var startMs = root.lyricsLines[index].startTime
-        if (startMs < 0)
+        console.warn("[LiveLyrics] MPRIS 不可用，无法 seek 歌词跳转（SPlayer 协议无 seek 命令）")
+    }
+
+    // 上一曲：优先 MPRIS，失效时回退 WebSocket control
+    function prevTrack() {
+        var player = root.mprisPlayer
+        if (root.mprisUsable && player && player.canGoPrevious) {
+            player.previous()
             return
-        player.position = startMs / 1000
-        console.info("[LiveLyrics] ⏩ 跳转到歌词行 " + index + " (" + root._fmtTime(startMs) + ")")
+        }
+        root._wsCommand("prev")
+    }
+
+    // 下一曲：优先 MPRIS，失效时回退 WebSocket control
+    function nextTrack() {
+        var player = root.mprisPlayer
+        if (root.mprisUsable && player && player.canGoNext) {
+            player.next()
+            return
+        }
+        root._wsCommand("next")
     }
 
     // 退出 SPlayer（终止全部相关进程；Bar 组件会经 visibilityCommand 自动隐藏）
@@ -624,22 +738,27 @@ PluginComponent {
             spacing: Theme.spacingS
             anchors.verticalCenter: parent.verticalCenter
 
-            // 状态图标：播放中=pause，暂停=play_arrow（与 SPlayer 按钮语义一致），未连接=cloud_off
+            // 状态图标：播放中=主题色，暂停=前景/背景互换（中性底+深色图标），未连接=红色
+            // 背景 14px，更接近 Bar 聚焦应用图标大小
             Rectangle {
-                width: 20
-                height: 20
-                radius: 10
+                width: 14
+                height: 14
+                radius: 7
                 anchors.verticalCenter: parent.verticalCenter
                 color: root.connected
-                    ? (root.isPlaying ? Theme.withAlpha(Theme.primary, 0.15) : Theme.withAlpha(Theme.secondary, 0.15))
+                    ? (root.isPlaying
+                        ? Theme.withAlpha(Theme.primary, 0.15)
+                        : Theme.withAlpha(Theme.surfaceVariantText, 0.6))   // 暂停背景=中性60%
                     : Theme.withAlpha(Theme.error, 0.12)
 
                 DankIcon {
                     anchors.centerIn: parent
                     name: root.connected ? "music_note" : "cloud_off"
-                    size: Theme.fontSizeSmall - 1
+                    size: 10
                     color: root.connected
-                        ? (root.isPlaying ? Theme.primary : Theme.secondary)
+                        ? (root.isPlaying
+                            ? Theme.primary
+                            : Theme.surfaceContainerHighest)  // 暂停图标=浅底
                         : Theme.error
                 }
             }
@@ -710,21 +829,27 @@ PluginComponent {
             spacing: Theme.spacingXS
 
             // 状态图标（音乐/未连接）＋圆形蒙版（与水平 Bar 一致）
+            // 播放中=主题色，暂停=前景/背景互换（中性底+深色图标），未连接=红色
+            // 背景 14px，更接近 Bar 聚焦应用图标大小
             Rectangle {
-                width: 20
-                height: 20
-                radius: 10
+                width: 14
+                height: 14
+                radius: 7
                 anchors.horizontalCenter: parent.horizontalCenter
                 color: root.connected
-                    ? (root.isPlaying ? Theme.withAlpha(Theme.primary, 0.15) : Theme.withAlpha(Theme.secondary, 0.15))
+                    ? (root.isPlaying
+                        ? Theme.withAlpha(Theme.primary, 0.15)
+                        : Theme.withAlpha(Theme.surfaceVariantText, 0.6))   // 暂停背景=中性60%
                     : Theme.withAlpha(Theme.error, 0.12)
 
                 DankIcon {
                     anchors.centerIn: parent
                     name: root.connected ? "music_note" : "cloud_off"
-                    size: Theme.fontSizeSmall - 1
+                    size: 10
                     color: root.connected
-                        ? (root.isPlaying ? Theme.primary : Theme.secondary)
+                        ? (root.isPlaying
+                            ? Theme.primary
+                            : Theme.surfaceContainerHighest)  // 暂停图标=浅底
                         : Theme.error
                 }
             }
@@ -837,110 +962,31 @@ PluginComponent {
             // 副标题移除：歌曲标题与下方歌曲信息卡重复
             showCloseButton: true
 
-            // 右上角操作区：上一曲 / 播放·暂停 / 下一曲（位于关闭按钮左侧）
-            // 播放按钮用主题色强调；上下曲按钮参照关闭按钮设计（透明 + hover 反馈）
+            // 右上角操作区：退出 SPlayer 电源按钮（关闭按钮左侧）
+            // 播放控制（上一曲/播放暂停/下一曲）已移到播放卡片标题右侧
             headerActions: Component {
-                Row {
-                    spacing: Theme.spacingXS
+                // 退出 SPlayer（电源按钮：红色 hover 警示，参照关闭按钮风格）
+                Rectangle {
+                    width: 32
+                    height: 32
+                    radius: 16
+                    color: powerBtn.containsMouse
+                        ? Theme.withAlpha(Theme.error, 0.15)
+                        : "transparent"
 
-                    // 上一曲（参照关闭按钮设计：透明背景 + hover 反馈）
-                    Rectangle {
-                        width: 32
-                        height: 32
-                        radius: 16
-                        color: prevBtn.containsMouse
-                            ? Theme.withAlpha(Theme.surfaceContainerHigh, 0.6)
-                            : "transparent"
-
-                        MouseArea {
-                            id: prevBtn
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: root.mprisPlayer?.previous()
-                        }
-
-                        DankIcon {
-                            anchors.centerIn: parent
-                            name: "skip_previous"
-                            size: Theme.iconSize - 4
-                            color: prevBtn.containsMouse ? Theme.primary : Theme.surfaceText
-                        }
+                    MouseArea {
+                        id: powerBtn
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.quitSPlayer()
                     }
 
-                    // 播放/暂停（主题色圆形背景 + 黑色图标）
-                    Rectangle {
-                        width: 32
-                        height: 32
-                        radius: 16
-                        color: root.connected
-                            ? (playHeaderBtn.containsMouse ? Qt.lighter(Theme.primary, 1.15) : Theme.primary)
-                            : Theme.surfaceVariantText
-
-                        MouseArea {
-                            id: playHeaderBtn
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: root.togglePlayPause()
-                        }
-
-                        DankIcon {
-                            anchors.centerIn: parent
-                            name: root.isPlaying ? "pause" : "play_arrow"
-                            size: 18
-                            color: "#000000"
-                        }
-                    }
-
-                    // 下一曲（参照关闭按钮设计：透明背景 + hover 反馈）
-                    Rectangle {
-                        width: 32
-                        height: 32
-                        radius: 16
-                        color: nextBtn.containsMouse
-                            ? Theme.withAlpha(Theme.surfaceContainerHigh, 0.6)
-                            : "transparent"
-
-                        MouseArea {
-                            id: nextBtn
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: root.mprisPlayer?.next()
-                        }
-
-                        DankIcon {
-                            anchors.centerIn: parent
-                            name: "skip_next"
-                            size: Theme.iconSize - 4
-                            color: nextBtn.containsMouse ? Theme.primary : Theme.surfaceText
-                        }
-                    }
-
-                    // 退出 SPlayer（电源按钮：红色 hover 警示，参照关闭按钮风格）
-                    Rectangle {
-                        width: 32
-                        height: 32
-                        radius: 16
-                        color: powerBtn.containsMouse
-                            ? Theme.withAlpha(Theme.error, 0.15)
-                            : "transparent"
-
-                        MouseArea {
-                            id: powerBtn
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: root.quitSPlayer()
-                        }
-
-                        DankIcon {
-                            anchors.centerIn: parent
-                            name: "power_settings_new"
-                            size: Theme.iconSize - 4
-                            color: powerBtn.containsMouse ? Theme.error : Theme.surfaceText
-                        }
+                    DankIcon {
+                        anchors.centerIn: parent
+                        name: "power_settings_new"
+                        size: Theme.iconSize - 4
+                        color: powerBtn.containsMouse ? Theme.error : Theme.surfaceText
                     }
                 }
             }
@@ -1009,11 +1055,11 @@ PluginComponent {
 
                         // 信息列（歌名 / 作者 / 专辑 / 进度）
                         Column {
-                            id: nowPlayingCol
-                            width: _coverArt.visible ? parent.width - _coverArt.width - parent.spacing : parent.width
+                            id: popoutTitleCol
+                            width: rightCol.visible ? parent.width - rightCol.width - parent.spacing : parent.width
                             spacing: Theme.spacingS
 
-                            // 歌名（独立大标题）
+                            // 歌名（独立大标题，最多两行，超长省略）
                             StyledText {
                                 width: parent.width
                                 text: root.displayTitle !== "" ? root.displayTitle : "没有正在播放的歌曲"
@@ -1085,10 +1131,10 @@ PluginComponent {
                                 width: parent.width
                                 height: 20
                                 anchors.horizontalCenter: parent.horizontalCenter
-                                visible: root.mprisPlayer !== null
+                                visible: root.mprisUsable
                                 isPlaying: root.mprisPlayer?.playbackState === MprisPlaybackState.Playing
-                                value: root.mprisPlayer !== null ? 0 : 0   // 由下方轮询 Timer 驱动
-                                actualValue: root.mprisPlayer !== null ? 0 : 0
+                                value: root.mprisUsable ? 0 : 0   // 由下方轮询 Timer 驱动
+                                actualValue: root.mprisUsable ? 0 : 0
                                 fillColor: Theme.primary
                                 playheadColor: Theme.primary
                                 trackColor: Theme.withAlpha(Theme.surfaceVariant, 0.40)  // 未播放部分（浅色可见）
@@ -1112,7 +1158,7 @@ PluginComponent {
                             // 轮询 MPRIS 位置，驱动波形进度条
                             Timer {
                                 interval: 50
-                                running: root.mprisPlayer !== null
+                                running: root.mprisUsable
                                 repeat: true
                                 onTriggered: {
                                     if (root.mprisPlayer) {
@@ -1131,7 +1177,7 @@ PluginComponent {
                                 width: parent.width
                                 height: 6
                                 radius: 3
-                                visible: root.mprisPlayer === null
+                                visible: !root.mprisUsable
                                 color: Theme.withAlpha(Theme.surfaceContainerHighest, 0.6)
 
                                 Rectangle {
@@ -1169,16 +1215,111 @@ PluginComponent {
                             }
                         }
 
-                        // 专辑封面（来自 MPRIS）
-                        DankAlbumArt {
-                            id: _coverArt
+                        // 右侧列：专辑封面 + 播放控制按钮（封面下方，与进度条水平对齐）
+                        // visible 用 mprisUsable 判断（避免失效引用导致整列不可见）
+                        Column {
+                            id: rightCol
                             width: 80
-                            height: 80
-                            visible: root.mprisPlayer !== null
-                                && (root.mprisPlayer.trackArtUrl ?? "") !== ""
+                            spacing: Theme.spacingS
                             anchors.verticalCenter: parent.verticalCenter
-                            activePlayer: root.mprisPlayer
-                            showAnimation: true
+                            visible: root.mprisUsable
+                                && (root.mprisPlayer.trackArtUrl ?? "") !== ""
+
+                            // 专辑封面（来自 MPRIS）
+                            DankAlbumArt {
+                                id: _coverArt
+                                width: 80
+                                height: 80
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                activePlayer: root.mprisPlayer
+                                showAnimation: true
+                            }
+
+                            // 控制按钮组：上一曲 / 播放·暂停 / 下一曲
+                            // （封面下方，视觉上与左侧进度条行水平对齐）
+                            Row {
+                                width: parent.width
+                                spacing: Theme.spacingXS
+                                anchors.horizontalCenter: parent.horizontalCenter
+
+                                // 上一曲（透明背景 + hover 反馈）
+                                Rectangle {
+                                    width: 22
+                                    height: 22
+                                    radius: 11
+                                    color: titlePrevBtn.containsMouse
+                                        ? Theme.withAlpha(Theme.surfaceContainerHigh, 0.6)
+                                        : "transparent"
+                                    anchors.verticalCenter: parent.verticalCenter
+
+                                    MouseArea {
+                                        id: titlePrevBtn
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.prevTrack()
+                                    }
+
+                                    DankIcon {
+                                        anchors.centerIn: parent
+                                        name: "skip_previous"
+                                        size: Theme.iconSize - 8
+                                        color: titlePrevBtn.containsMouse ? Theme.primary : Theme.surfaceText
+                                    }
+                                }
+
+                                // 播放/暂停（主题色圆形背景 + 黑色图标）
+                                Rectangle {
+                                    width: 26
+                                    height: 26
+                                    radius: 13
+                                    color: root.connected
+                                        ? (titlePlayBtn.containsMouse ? Qt.lighter(Theme.primary, 1.15) : Theme.primary)
+                                        : Theme.surfaceVariantText
+                                    anchors.verticalCenter: parent.verticalCenter
+
+                                    MouseArea {
+                                        id: titlePlayBtn
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.togglePlayPause()
+                                    }
+
+                                    DankIcon {
+                                        anchors.centerIn: parent
+                                        name: root.isPlaying ? "pause" : "play_arrow"
+                                        size: 15
+                                        color: "#000000"
+                                    }
+                                }
+
+                                // 下一曲（透明背景 + hover 反馈）
+                                Rectangle {
+                                    width: 22
+                                    height: 22
+                                    radius: 11
+                                    color: titleNextBtn.containsMouse
+                                        ? Theme.withAlpha(Theme.surfaceContainerHigh, 0.6)
+                                        : "transparent"
+                                    anchors.verticalCenter: parent.verticalCenter
+
+                                    MouseArea {
+                                        id: titleNextBtn
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.nextTrack()
+                                    }
+
+                                    DankIcon {
+                                        anchors.centerIn: parent
+                                        name: "skip_next"
+                                        size: Theme.iconSize - 8
+                                        color: titleNextBtn.containsMouse ? Theme.primary : Theme.surfaceText
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1187,6 +1328,8 @@ PluginComponent {
                 // 标题行：歌词图标 + "歌词"（与上方 SPlayer 标题对齐）
                 // 图标尺寸与作者/专辑行一致（14px），并用 y 微调垂直居中，
                 // 避免图标因字形基线差异显得略高
+                // 注意：不能用 anchors.verticalCenter（anchors 会覆盖 y 赋值，
+                // 导致偏移不生效），改用显式 y 计算 = 居中 + 下移补偿
                 Row {
                     width: parent.width
                     leftPadding: Theme.spacingS
@@ -1196,8 +1339,8 @@ PluginComponent {
                         name: "lyrics"
                         size: 14
                         color: Theme.surfaceVariantText
-                        anchors.verticalCenter: parent.verticalCenter
-                        y: 4   // 微调：与文字视觉居中对齐（图标字形偏高，下移补偿）
+                        // 垂直居中（Row 高度内）再下移 1px 补偿字形偏移
+                        y: (parent.height - height) / 2 + 1
                     }
 
                     StyledText {
@@ -1244,8 +1387,11 @@ PluginComponent {
                         visible: root.lyricsLines.length > 0
 
                         // 高亮条：当前行背景平滑滑动（行切换渐变效果）
+                        // x/width 与 delegate 文字 padding 对齐（左右完全相等）
                         highlight: Rectangle {
-                            width: lyricList.width
+                            readonly property real hPad: Theme.spacingM
+                            x: Theme.spacingM
+                            width: lyricList.width - Theme.spacingM - hPad
                             radius: Theme.cornerRadius
                             color: Theme.withAlpha(Theme.primary, 0.10)
 
@@ -1270,22 +1416,22 @@ PluginComponent {
                             }
 
                             // 每行三行结构：原文（大）→ 中文翻译（较小）→ 罗马音（最小）
-                            // 四边 padding：文字与高亮条（圆角矩形）边缘留出间距，
-                            // 确保文字被高亮区域完整包裹。
-                            // 右侧 padding 略大于左侧：富文本/滚动条在右侧留白，
-                            // 使左右视觉边距均衡
+                            // 文字 padding 与高亮条缩进完全一致（spacingM），
+                            // 左右完全相等，保证高亮条与文字对齐稳定
                             Column {
                                 id: lyricRow
                                 width: parent.width
                                 leftPadding: Theme.spacingM
-                                rightPadding: Theme.spacingM + Theme.spacingXS
+                                rightPadding: Theme.spacingM
                                 topPadding: Theme.spacingS
                                 bottomPadding: Theme.spacingS
                                 spacing: 4
 
                                 // 原文歌词（大）：当前行逐字高亮（yrc），否则整行高亮
+                                // 宽度减一字宽：提前约一个字 elide/换行，
+                                // 右端留出可见留白，避免紧贴高亮条边界
                                 StyledText {
-                                    width: parent.width
+                                    width: parent.width - Theme.fontSizeMedium
                                     text: root._wordHighlightHtml(modelData, index === root.currentLineIndex)
                                         || modelData.text
                                     textFormat: Text.RichText
@@ -1307,7 +1453,7 @@ PluginComponent {
 
                                 // 中文翻译（较小）
                                 StyledText {
-                                    width: parent.width
+                                    width: parent.width - Theme.fontSizeSmall
                                     text: modelData.translated
                                     visible: modelData.translated !== ""
                                     font.pixelSize: Theme.fontSizeSmall
@@ -1318,7 +1464,7 @@ PluginComponent {
 
                                 // 罗马音（最小 + 斜体）
                                 StyledText {
-                                    width: parent.width
+                                    width: parent.width - (Theme.fontSizeSmall - 1)
                                     text: modelData.roman
                                     visible: modelData.roman !== ""
                                     font.pixelSize: Theme.fontSizeSmall - 1

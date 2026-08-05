@@ -1,7 +1,6 @@
 # DMS SPlayer Lyrics
 
-一个用于 **DankMaterialShell (DMS)** 的实时歌词插件，通过 WebSocket 连接 **SPlayer**，
-将当前播放歌曲的同步歌词显示在 DankBar 上。
+一个用于 **DankMaterialShell (DMS)** 的实时歌词插件，通过 WebSocket 连接 **SPlayer**，将当前播放歌曲的同步歌词显示在 DankBar 上。
 
 ## 说明
 
@@ -37,13 +36,15 @@
 - Popout 右上角控制按钮: 上一曲 / 播放·暂停 / 下一曲
 - 无歌词时显示歌曲标题 (可关闭) 
 - SPlayer 进程未启动时自动隐藏 Bar 组件 (每 5 秒检测一次，可关闭，SPlayer 启动后自动恢复) 
+- **MPRIS 自愈**: SPlayer/DMS 重启后自动重新激活 MPRIS 播放器，封面/控制/进度恢复 (无需手动操作) 
+- **控制回退**: MPRIS 不可用时播放/暂停/上下曲自动回退 SPlayer WebSocket `control` 命令
 
 ## 安装
 
 1. 将插件目录复制到 DMS 插件目录 (目录名必须是 `livelyrics`，插件内部依赖该路径定位 bridge 脚本) : 
 
    ```bash
-   git clone https://gitlab.com/noahpolimon/dms-plugin-livelyrics ~/.config/DankMaterialShell/plugins/livelyrics
+   git clone https://github.com/ayyyyano/DMS-SPlayer-Lyrics.git ~/.config/DankMaterialShell/plugins/livelyrics
    # 或手动复制: 
    # cp -r <本目录> ~/.config/DankMaterialShell/plugins/livelyrics
    ```
@@ -92,8 +93,9 @@ bridge/splayer_bridge.py    —— Python 客户端: 自动重连 (指数退避)
 Quickshell Process + SplitParser("\n")   —— 读取 bridge 输出
     ▼
 LiveLyrics.qml              —— JSON 解析、事件分发、按 currentTime 查找当前歌词
-    ▼
-Bar Pill / Popout           —— 歌词显示 (三行歌词: 原文 / 翻译 / 罗马音、歌词预览) 
+    ▲                                │
+    │ stdin 控制命令 (control)        ▼
+    └──────────────────────────────── Bar Pill / Popout —— 歌词显示 (三行歌词: 原文 / 翻译 / 罗马音、歌词预览) 
     ▼
 MPRIS (可选)               —— 专辑封面、波形进度条、播放/暂停/上下曲控制、点击歌词 seek
 ```
@@ -105,6 +107,9 @@ MPRIS (可选)               —— 专辑封面、波形进度条、播放/暂�
 ```bash
 # 查看 DMS 日志
 journalctl --user -u dankmaterialshell -f | grep -i livelyrics
+
+# 查看插件加载状态
+ dms ipc call plugin-scan status liveLyrics
 
 # 单独测试 bridge (不经过 DMS)  : 
 python3 ~/.config/DankMaterialShell/plugins/livelyrics/bridge/splayer_bridge.py 127.0.0.1 25885
@@ -119,6 +124,9 @@ DMS_LIVELYRICS_PYTHON=/path/to/python              # 自定义 python (如 venv)
 SPlayer WebSocket 协议 (实测确认) : 
 
 - 连接后 SPlayer 推送 `welcome` 事件。
+- **主动请求**: 发送 `get-song-info` 可获取当前歌曲完整状态 (含 `lrcData`/`yrcData` 歌词) ，插件用于重启后状态恢复。
+- **控制命令**: 发送 `{"type": "control", "data": {"command": "toggle|play|pause|next|prev"}}` 控制播放，插件作为 MPRIS 不可用时的回退通道。
+- **心跳**: 发送 `PING` 收到 `PONG`。
 - `progress-change` 约每 500ms 推送一次，含 `timestamp` 字段。
 - `song-change` 的 `title` 为「歌名 - 歌手」组合格式，`name` 为纯歌名。
 - `lyric-change` 的 `lrcData` 每项是一行: 
@@ -126,8 +134,8 @@ SPlayer WebSocket 协议 (实测确认) :
   - `translatedLyric` / `romanLyric`: 翻译 / 罗马音 (字符串或数组) 
   - 行级 `startTime`/`endTime` 字段 (插件优先使用) 
   - 无歌词时 `lrcData` 为空数组
-- 时间单位均为毫秒；SPlayer 不重放当前状态，仅推送新事件。
-- **拖动进度条 / 单曲循环回退 / 暂停·恢复播放时，SPlayer 都会重推同一首歌的
+- 时间单位均为毫秒；SPlayer 不重放当前状态，仅推送新事件 (插件通过 `get-song-info` 主动恢复) 。
+- **拖动进度条 / 点击歌词 seek / 单曲循环回退 / 暂停·恢复播放时，SPlayer 都会重推同一首歌的
   `song-change`，但不重推 `lyric-change`** (歌词数据仍有效，插件会识别同曲并保留歌词，仅刷新时长)。
 
 ## 常见问题
@@ -135,9 +143,9 @@ SPlayer WebSocket 协议 (实测确认) :
 - **Bar 上的歌词组件完全消失 (不是显示「未连接」)**: 正常行为——插件每 5 秒检测一次 SPlayer 进程。
 - **SPlayer 进程未启动时组件自动隐藏**。启动 SPlayer 后最多 5 秒内组件自动恢复。可在插件设置中关闭「SPlayer 未启动时自动隐藏」开关（DMS 设置 → 插件 → DMS SPlayer Lyrics）。
 - **Bar 上显示「SPlayer 未连接」**: 说明 SPlayer 进程在运行但 WebSocket 尚未就绪 (或端口设置错误)。确认 SPlayer 设置 → 网络与连接 已启用 WebSocket (默认 `127.0.0.1:25885`)；bridge 会自动重连，无需重启 DMS。
-- **歌词一直显示「等待歌词」**: SPlayer 只在换歌时推送 `lyric-change`，重连后需等下一首歌才会收到歌词 (正在播放的歌曲不会重放)。
-- **点击歌词行不跳转**: 需要 MPRIS 支持 seek (绝大多数播放器支持)；不支持时日志会提示。
-- **详情页无专辑封面/波形**: 插件从 MPRIS 获取封面与进度，确认 SPlayer 已通过 MPRIS 注册 (DMS 媒体控件能显示即可)。
+- **歌词一直显示「等待歌词」**: 多为首次连接尚未收到 `lyric-change`；连接后插件会主动 `get-song-info` 恢复歌词，重启 DMS 后无需等切歌。
+- **点击歌词行不跳转**: 需要 MPRIS 支持 seek (绝大多数播放器支持)；MPRIS 不可用时提示不支持 (SPlayer 协议无 seek 命令)。
+- **详情页无专辑封面/波形**: 插件从 MPRIS 获取封面与进度，确认 SPlayer 已通过 MPRIS 注册 (DMS 媒体控件能显示即可)；MPRIS 失效时自动回退 WebSocket 模式。
 - **建议设置 SPlayer 开机自启**: 防止可能的不必要空间占用与重连等待。
 
 ## 文件结构
