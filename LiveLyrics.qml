@@ -37,8 +37,15 @@ PluginComponent {
     property string splayerHost: pluginData.splayerHost ?? "127.0.0.1"
     property string splayerPort: pluginData.splayerPort ?? "25885"
     property bool showTitleFallback: pluginData.showTitleFallback ?? true
-    // 状态栏（Bar）歌词显示语言："original" 原文 | "translation" 中文翻译 | "both" 原文+翻译
+    // 状态栏（Bar）歌词显示样式："original" 原文 | "translation" 中文翻译
+    // | "both" 原文+翻译 | "hidden" 隐藏（仅保留音乐图标）
     property string barLyricMode: pluginData.barLyricMode ?? "original"
+    // 歌词滚动速度（px/帧，每 25ms 一帧；水平/垂直 Bar 共用，默认 2.5）
+    // 设置页为文本输入（一位小数），此处解析字符串
+    property real vScrollSpeed: {
+        var raw = parseFloat(pluginData.vScrollSpeed)
+        return raw > 0 ? raw : 2.5
+    }
     // SPlayer 进程未启动时自动隐藏 Bar 组件（可在设置页切换）
     property bool autoHideWhenClosed: pluginData.autoHideWhenClosed ?? true
 
@@ -321,9 +328,12 @@ PluginComponent {
                 var w = item.words[j]
                 if (!w)
                     continue
-                if (text !== "")
+                var word = w.word || ""
+                // 拼接：word 自带前导空格（yrc 实测如 " に"）时不再叠加空格，
+                // 否则会出现双空格（详情页非当前行/Bar 显示异常）
+                if (text !== "" && word !== "" && !word.startsWith(" ") && !text.endsWith(" "))
                     text += " "
-                text += (w.word || "")
+                text += word
                 if (startTime < 0 && typeof w.startTime === "number")
                     startTime = w.startTime
                 if (typeof w.endTime === "number" && w.endTime > endTime)
@@ -332,10 +342,12 @@ PluginComponent {
                 words.push({
                     startTime: typeof w.startTime === "number" ? w.startTime : -1,
                     endTime: typeof w.endTime === "number" ? w.endTime : -1,
-                    word: w.word || ""
+                    word: word
                 })
             }
-            if (startTime < 0 || text.trim() === "")
+            // 整行空格规范化：多空格合并为单空格，去除首尾
+            text = text.replace(/\s+/g, " ").trim()
+            if (startTime < 0 || text === "")
                 continue
             lines.push({
                 startTime: startTime,
@@ -406,12 +418,21 @@ PluginComponent {
         if (!isCurrent || root.currentWordIndex < 0)
             return null
         var html = ""
+        var emitted = false   // 是否已输出过可见词（决定是否补词间空格）
         for (var i = 0; i < line.words.length; i++) {
             var w = line.words[i]
-            if (w.word === undefined || w.word === null)
+            if (!w || w.word === undefined || w.word === null)
                 continue
+            // trim 掉 word 自带的前导/尾随空格（yrc 如 " に"），
+            // 词间统一补单空格 → 渲染结果与规范化的 line.text 完全一致
+            var word = w.word.trim()
+            if (word === "")
+                continue
+            if (emitted)
+                html += " "
             var spanColor = (i <= root.currentWordIndex) ? Theme.primary : Theme.surfaceText
-            html += "<span style='color:" + spanColor + ";'>" + w.word + "</span>"
+            html += "<span style='color:" + spanColor + ";'>" + word + "</span>"
+            emitted = true
         }
         return html
     }
@@ -457,6 +478,8 @@ PluginComponent {
         if (!line)
             return ""
         switch (root.barLyricMode) {
+        case "hidden":
+            return ""   // 隐藏模式：Bar 上不显示歌词
         case "translation":
             return line.translated !== "" ? line.translated : line.text
         case "both":
@@ -466,12 +489,15 @@ PluginComponent {
         }
     }
 
-    // Bar Pill 主文本：优先歌词，其次歌名
+    // Bar 主文本（水平/垂直通用）：优先歌词，其次歌名（showTitleFallback 控制）
     readonly property string pillText: {
         if (!root.connected)
             return "SPlayer 未连接"
         if (root.barLyricText !== "")
             return root.barLyricText
+        // 无歌词：showTitleFallback 开 → 显示歌名；关 → 等待提示
+        if (root.currentTitle && root.showTitleFallback)
+            return root.currentTitle
         if (root.currentTitle)
             return root.currentTitle
         return "等待歌词…"
@@ -487,6 +513,24 @@ PluginComponent {
             player.togglePlaying()
         else
             console.warn("[LiveLyrics] MPRIS 播放器不可用，无法切换播放/暂停")
+    }
+
+    // 点击歌词行 → 将播放进度 seek 到该行开始处
+    // （通过 MPRIS position 写入，与 DMS 媒体控件 DankSeekbar 同款 API；
+    //   单位：秒。seek 后 SPlayer 会推送新的 progress-change 驱动歌词跳转）
+    function seekToLine(index) {
+        if (index < 0 || index >= root.lyricsLines.length)
+            return
+        var player = root.mprisPlayer
+        if (!player || !player.canSeek) {
+            console.warn("[LiveLyrics] MPRIS 播放器不支持 seek，无法跳转歌词")
+            return
+        }
+        var startMs = root.lyricsLines[index].startTime
+        if (startMs < 0)
+            return
+        player.position = startMs / 1000
+        console.info("[LiveLyrics] ⏩ 跳转到歌词行 " + index + " (" + root._fmtTime(startMs) + ")")
     }
 
     function _fmtTime(ms) {
@@ -522,9 +566,7 @@ PluginComponent {
 
                 DankIcon {
                     anchors.centerIn: parent
-                    name: root.connected
-                        ? (root.isPlaying ? "pause" : "play_arrow")
-                        : "cloud_off"
+                    name: root.connected ? "music_note" : "cloud_off"
                     size: Theme.fontSizeSmall - 1
                     color: root.connected
                         ? (root.isPlaying ? Theme.primary : Theme.secondary)
@@ -538,6 +580,7 @@ PluginComponent {
                 width: Math.min(marqueeText.contentWidth, 240)
                 height: marqueeText.implicitHeight
                 anchors.verticalCenter: parent.verticalCenter
+                visible: root.barLyricMode !== "hidden"   // 隐藏模式只留图标
 
                 readonly property real overflow: marqueeText.contentWidth - width
                 readonly property bool overflowing: overflow > 0
@@ -552,6 +595,14 @@ PluginComponent {
                 onWidthChanged: Qt.callLater(resetScroll)
                 onOverflowingChanged: Qt.callLater(resetScroll)
                 Component.onCompleted: Qt.callLater(resetScroll)
+
+                // 速度变化时重启滚动（root 属性需用 Connections 监听）
+                Connections {
+                    target: root
+                    function onVScrollSpeedChanged() {
+                        lyricMarquee.resetScroll()
+                    }
+                }
 
                 StyledText {
                     id: marqueeText
@@ -571,7 +622,8 @@ PluginComponent {
                             target: marqueeText
                             property: "x"
                             to: -lyricMarquee.overflow
-                            duration: lyricMarquee.overflow * 15
+                            // 速度与垂直 Bar 一致：总时长 = 距离 / 速度 × 帧间隔
+                            duration: Math.max(200, (lyricMarquee.overflow / root.vScrollSpeed) * 25)
                             easing.type: Easing.InOutQuad
                         }
                     }
@@ -587,20 +639,122 @@ PluginComponent {
         Column {
             spacing: Theme.spacingXS
 
-            DankIcon {
-                name: root.connected ? (root.isPlaying ? "pause" : "play_arrow") : "cloud_off"
-                size: Theme.iconSize
-                color: root.connected ? (root.isPlaying ? Theme.primary : Theme.secondary) : Theme.error
+            // 状态图标（音乐/未连接）＋圆形蒙版（与水平 Bar 一致）
+            Rectangle {
+                width: 20
+                height: 20
+                radius: 10
                 anchors.horizontalCenter: parent.horizontalCenter
+                color: root.connected
+                    ? (root.isPlaying ? Theme.withAlpha(Theme.primary, 0.15) : Theme.withAlpha(Theme.secondary, 0.15))
+                    : Theme.withAlpha(Theme.error, 0.12)
+
+                DankIcon {
+                    anchors.centerIn: parent
+                    name: root.connected ? "music_note" : "cloud_off"
+                    size: Theme.fontSizeSmall - 1
+                    color: root.connected
+                        ? (root.isPlaying ? Theme.primary : Theme.secondary)
+                        : Theme.error
+                }
             }
 
-            StyledText {
-                text: root.currentLineText !== "" ? "♪" : (root.currentTitle ? "♫" : "…")
-                font.pixelSize: Theme.fontSizeSmall
-                color: Theme.surfaceText
+            // 竖排歌词：每个字符垂直排列（左右 Bar 窄，横排放不下）
+            // 高度自适应：歌词短时贴合内容（不占多余空间），
+            // 超长时封顶 180px 自动向上滚动显示
+            // hidden 模式下隐藏（只保留音乐图标，详情页仍可点击打开）
+            Item {
+                id: vLyricWrap
+                width: Theme.fontSizeSmall + 6        // 单字符宽度
+                height: Math.min(vLyricText.implicitHeight, 180)   // 自适应 + 封顶
+                clip: true
                 anchors.horizontalCenter: parent.horizontalCenter
+                visible: root.barLyricMode !== "hidden"
+
+                StyledText {
+                    id: vLyricText
+                    width: parent.width
+                    // 逐字竖排：字间换行
+                    text: root.pillText !== "" ? root._verticalize(root.pillText) : "…"
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceText
+                    wrapMode: Text.WrapAnywhere
+                    horizontalAlignment: Text.AlignHCenter
+                    lineHeight: 1.2
+                    maximumLineCount: 999
+                    anchors.horizontalCenter: parent.horizontalCenter
+
+                    // 超出高度时向上滚动（垂直跑马灯）
+                    readonly property real overflow: implicitHeight - vLyricWrap.height
+                    readonly property bool overflowing: overflow > 0
+
+                    // 换行/高度变化时处理滚动状态：
+                    //   - 新歌词短于容器 → 回顶部静态显示
+                    //   - 新歌词超长 → 每句都从顶部（起始）开始滚动，
+                    //     短暂暂停后滚到底（保证每句完整从头展示）
+                    function resetScroll() {
+                        vScrollTimer.stop()
+                        vScrollPause.stop()
+                        if (!overflowing) {
+                            y = 0
+                            return
+                        }
+                        y = 0
+                        vScrollPause.start()
+                    }
+
+                    onTextChanged: Qt.callLater(resetScroll)
+                    onOverflowingChanged: Qt.callLater(resetScroll)
+                    Component.onCompleted: Qt.callLater(resetScroll)
+
+                    // 速度变化时重启滚动（root 属性需用 Connections 监听）
+                    Connections {
+                        target: root
+                        function onVScrollSpeedChanged() {
+                            vLyricText.resetScroll()
+                        }
+                    }
+
+                    // 滚动执行器：每 25ms 上移 vScrollSpeed px（默认 2.4），滚到底停止
+                    // （用 Timer 而非 SequentialAnimation：动画 stop/start 会重置
+                    //   到暂停阶段且 from==to 时瞬间完成，导致换行后"不滚"）
+                    Timer {
+                        id: vScrollTimer
+                        interval: 25
+                        repeat: true
+                        onTriggered: {
+                            var target = -vLyricText.overflow
+                            vLyricText.y = Math.max(vLyricText.y - root.vScrollSpeed, target)
+                            if (vLyricText.y <= target)
+                                stop()
+                        }
+                    }
+
+                    // 滚动前短暂停留（让新歌词开头先可见）
+                    Timer {
+                        id: vScrollPause
+                        interval: 800
+                        repeat: false
+                        onTriggered: vScrollTimer.start()
+                    }
+                }
             }
         }
+    }
+
+    // 将文本转为逐字竖排（每字一行，空格保留为占位）
+    function _verticalize(text) {
+        if (!text)
+            return "…"
+        var out = ""
+        for (var i = 0; i < text.length; i++) {
+            var ch = text.charAt(i)
+            if (ch === " ")
+                continue      // 跳过空格：不输出占位行，避免挤占竖排屏幕面积
+            out += ch
+            out += "\n"
+        }
+        return out
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -728,7 +882,7 @@ PluginComponent {
 
                         StyledText {
                             text: root.connected
-                                ? ("已连接 SPlayer  " + root.splayerHost + ":" + root.splayerPort
+                                ? ("已连接  " + root.splayerHost + ":" + root.splayerPort
                                    + (root.isPlaying ? "  ·  播放中" : "  ·  已暂停"))
                                 : ("未连接  " + root.splayerHost + ":" + root.splayerPort
                                    + (root.lastError !== "" ? "  (" + root.lastError + ")" : "  ·  自动重连中"))
@@ -789,7 +943,9 @@ PluginComponent {
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
 
+                                // 宽度受限于父 Row（不延伸到专辑封面区域），超长省略号
                                 StyledText {
+                                    width: parent.width - 14 - parent.spacing
                                     text: root.currentArtist
                                     font.pixelSize: Theme.fontSizeMedium
                                     color: Theme.surfaceText
@@ -812,7 +968,9 @@ PluginComponent {
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
 
+                                // 宽度受限于父 Row（不延伸到专辑封面区域），超长省略号
                                 StyledText {
+                                    width: parent.width - 14 - parent.spacing
                                     text: root.currentAlbum
                                     font.pixelSize: Theme.fontSizeSmall
                                     color: Theme.surfaceVariantText
@@ -822,14 +980,38 @@ PluginComponent {
                                 }
                             }
 
-                            // 波形进度条（MPRIS 可用时，与 DMS 媒体控件一致）
-                            DankSeekbar {
-                                id: progressSeekbar
+                            // 波形进度条（M3WaveProgress 直接实例化，自定义颜色）：
+                            // DMS 的 DankSeekbar 波形 track 用 MediaAccentService.accentTrack
+                            // （封面主色 28% 透明度），深色封面时几乎不可见；
+                            // 这里直接使用波形组件本身，track 用浅色 surfaceVariant 保证可见，
+                            // 波形动画（播放时波动）完整保留
+                            M3WaveProgress {
+                                id: progressBar
                                 width: parent.width
                                 height: 20
                                 anchors.horizontalCenter: parent.horizontalCenter
-                                activePlayer: root.mprisPlayer
                                 visible: root.mprisPlayer !== null
+                                isPlaying: root.mprisPlayer?.playbackState === MprisPlaybackState.Playing
+                                value: root.mprisPlayer !== null ? 0 : 0   // 由下方轮询 Timer 驱动
+                                actualValue: root.mprisPlayer !== null ? 0 : 0
+                                fillColor: Theme.primary
+                                playheadColor: Theme.primary
+                                trackColor: Theme.withAlpha(Theme.surfaceVariant, 0.40)  // 未播放部分（浅色可见）
+                                actualProgressColor: Theme.onSurface_38
+
+                                // 点击进度条 seek（MPRIS 支持时）
+                                MouseArea {
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    enabled: root.mprisPlayer?.canSeek ?? false
+                                    onClicked: mouse => {
+                                        if (root.mprisPlayer && root.mprisPlayer.length > 0) {
+                                            var ratio = Math.max(0, Math.min(1, mouse.x / width))
+                                            root.mprisPlayer.position = ratio * root.mprisPlayer.length * 0.99
+                                        }
+                                    }
+                                }
                             }
 
                             // 轮询 MPRIS 位置，驱动波形进度条
@@ -838,11 +1020,12 @@ PluginComponent {
                                 running: root.mprisPlayer !== null
                                 repeat: true
                                 onTriggered: {
-                                    if (progressSeekbar && root.mprisPlayer) {
+                                    if (root.mprisPlayer) {
                                         try {
                                             var pos = root.mprisPlayer.position || 0
                                             var len = Math.max(1, root.mprisPlayer.length || 1)
-                                            progressSeekbar.value = Math.min(1, pos / len)
+                                            progressBar.value = Math.min(1, pos / len)
+                                            progressBar.actualValue = progressBar.value
                                         } catch (e) {}
                                     }
                                 }
@@ -966,6 +1149,14 @@ PluginComponent {
 
                             width: ListView.view.width
                             height: lyricRow.implicitHeight
+
+                            // 点击歌词行 → seek 到该行开始处（MPRIS）
+                            MouseArea {
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.seekToLine(index)
+                            }
 
                             // 每行三行结构：原文（大）→ 中文翻译（较小）→ 罗马音（最小）
                             // 四边 padding：文字与高亮条（圆角矩形）边缘留出间距，

@@ -103,14 +103,23 @@ PluginSettings {
 
             SelectionSetting {
                 settingKey: "barLyricMode"
-                label: "状态栏歌词语言"
-                description: "Bar 上显示的歌词：原文 / 中文翻译 / 原文+翻译"
+                label: "状态栏歌词样式"
+                description: "Bar 上歌词显示：原文 / 中文翻译 / 原文+翻译 / 隐藏（仅保留音乐图标）"
                 options: [
                     { label: "原文", value: "original" },
                     { label: "中文翻译", value: "translation" },
-                    { label: "原文 + 翻译", value: "both" }
+                    { label: "原文 + 翻译", value: "both" },
+                    { label: "隐藏", value: "hidden" }
                 ]
                 defaultValue: "original"
+            }
+
+            StringSetting {
+                settingKey: "vScrollSpeed"
+                label: "歌词滚动速度"
+                description: "水平/垂直 Bar 歌词滚动速度（px/帧，每 25ms 一帧；支持一位小数，如 2.5）"
+                placeholder: "2.5"
+                defaultValue: "2.5"
             }
         }
     }

@@ -15,23 +15,11 @@
 [SPlayerLyric](https://github.com/iwvw/SPlayerLyric)  
 
 ## 预览
-![DEMO](screenshot.png)
 
-## 架构
+> 演示环境 Fedora 44 + Niri 26.04
 
-```
-SPlayer (ws://127.0.0.1:25885)
-    │  WebSocket JSON events (song-change / lyric-change / progress-change / status-change) 
-    ▼
-bridge/splayer_bridge.py    —— Python 客户端: 自动重连 (指数退避) ，
-    │                          stdout 每行输出一个 JSON
-    ▼
-Quickshell Process + SplitParser("\n")   —— 读取 bridge 输出
-    ▼
-LiveLyrics.qml              —— JSON 解析、事件分发、按 currentTime 查找当前歌词
-    ▼
-Bar Pill / Popout           —— 歌词显示 (三行歌词: 原文 / 翻译 / 罗马音、歌词预览) 
-```
+![水平 Bar 效果](horizontal.png) 
+![垂直 Bar 效果](vertical.png)
 
 ## 特性
 
@@ -41,11 +29,14 @@ Bar Pill / Popout           —— 歌词显示 (三行歌词: 原文 / 翻译 /
 - 详情页歌词列表三行显示: 原文 (大) → 中文翻译 (较小) → 罗马音 (最小斜体) 
 - 逐字歌词: SPlayer 推送 `yrcData` 时按字高亮当前演唱到哪一字 (无则回退整行高亮) 
 - 行切换渐变动画: 高亮条平滑滑动、当前行字号 / 颜色渐变过渡
-- 状态栏 (Bar) 歌词语言可切换: 原文 / 中文翻译 / 原文+翻译
-- Bar 上歌词过长时自动跑马灯滚动
-- Popout 显示: 连接状态、歌曲信息、专辑封面、波形进度条、歌词预览
+- 点击歌词行 → 播放进度跳转到该行开始处 (MPRIS seek) 
+- 状态栏 (Bar) 歌词样式: 原文 / 中文翻译 / 原文+翻译 / 隐藏 (仅保留音乐图标)
+- 水平 Bar: 歌词过长时自动跑马灯滚动 (速度可调) 
+- 垂直 Bar (左右侧): 竖排歌词逐字显示，超长自动向上滚动 (速度可调) 
+- Popout 显示: 连接状态、歌曲信息 (歌名/作者/专辑独立行) 、专辑封面、波形进度条、歌词预览
+- Popout 右上角控制按钮: 上一曲 / 播放·暂停 / 下一曲
 - 无歌词时显示歌曲标题 (可关闭) 
-- SPlayer 进程未启动时自动隐藏 Bar 组件 (每 5 秒检测一次，SPlayer 启动后自动恢复) 
+- SPlayer 进程未启动时自动隐藏 Bar 组件 (每 5 秒检测一次，可关闭，SPlayer 启动后自动恢复) 
 
 ## 安装
 
@@ -84,8 +75,28 @@ DMS 设置 → 插件 → DMS SPlayer Lyrics:
 |--------|------|--------|
 | 主机地址 | SPlayer WebSocket 地址 | `127.0.0.1` |
 | 端口 | SPlayer WebSocket 端口 | `25885` |
-| 状态栏歌词语言 | Bar 显示歌词: 原文 / 中文翻译 / 原文+翻译 | 原文 |
+| 状态栏歌词样式 | Bar 显示: 原文 / 中文翻译 / 原文+翻译 / 隐藏 (仅图标) | 原文 |
+| 歌词滚动速度 | 水平/垂直 Bar 歌词滚动速度 (px/帧，每 25ms 一帧，支持一位小数) | 2.5 |
 | 无歌词时显示歌曲标题 | 无歌词时 Bar 上显示歌曲名 | 开 |
+| SPlayer 未启动时自动隐藏 | SPlayer 进程未启动时隐藏 Bar 组件 | 开 |
+
+## 架构
+
+```
+SPlayer (ws://127.0.0.1:25885)
+    │  WebSocket JSON events (song-change / lyric-change / progress-change / status-change) 
+    ▼
+bridge/splayer_bridge.py    —— Python 客户端: 自动重连 (指数退避) ，
+    │                          stdout 每行输出一个 JSON
+    ▼
+Quickshell Process + SplitParser("\n")   —— 读取 bridge 输出
+    ▼
+LiveLyrics.qml              —— JSON 解析、事件分发、按 currentTime 查找当前歌词
+    ▼
+Bar Pill / Popout           —— 歌词显示 (三行歌词: 原文 / 翻译 / 罗马音、歌词预览) 
+    ▼
+MPRIS (可选)               —— 专辑封面、波形进度条、播放/暂停/上下曲控制、点击歌词 seek
+```
 
 ## 调试
 
@@ -125,6 +136,8 @@ SPlayer WebSocket 协议 (实测确认) :
 - **SPlayer 进程未启动时组件自动隐藏**。启动 SPlayer 后最多 5 秒内组件自动恢复。可在插件设置中关闭「SPlayer 未启动时自动隐藏」开关（DMS 设置 → 插件 → DMS SPlayer Lyrics）。
 - **Bar 上显示「SPlayer 未连接」**: 说明 SPlayer 进程在运行但 WebSocket 尚未就绪 (或端口设置错误)。确认 SPlayer 设置 → 网络与连接 已启用 WebSocket (默认 `127.0.0.1:25885`)；bridge 会自动重连，无需重启 DMS。
 - **歌词一直显示「等待歌词」**: SPlayer 只在换歌时推送 `lyric-change`，重连后需等下一首歌才会收到歌词 (正在播放的歌曲不会重放)。
+- **点击歌词行不跳转**: 需要 MPRIS 支持 seek (绝大多数播放器支持)；不支持时日志会提示。
+- **详情页无专辑封面/波形**: 插件从 MPRIS 获取封面与进度，确认 SPlayer 已通过 MPRIS 注册 (DMS 媒体控件能显示即可)。
 - **建议设置 SPlayer 开机自启**: 防止可能的不必要空间占用与重连等待。
 
 ## 文件结构
