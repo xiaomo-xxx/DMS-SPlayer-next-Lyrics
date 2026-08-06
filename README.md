@@ -1,6 +1,6 @@
 # DMS SPlayer Lyrics
 
-一个用于 **DankMaterialShell (DMS)** 的实时歌词插件，通过 WebSocket 连接 **SPlayer**，将当前播放歌曲的同步歌词显示在 DankBar 上。
+一个用于 **DankMaterialShell (DMS)** 的实时歌词插件，通过 WebSocket 连接 **SPlayer**，将当前播放歌曲的同步歌词显示在 DankBar 与桌面上。
 
 ## 说明
 
@@ -19,6 +19,7 @@
 
 ![水平 Bar 效果](horizontal.png) 
 ![垂直 Bar 效果](vertical.png)
+![桌面部件效果](desktop.png)
 
 ## 特性
 
@@ -32,12 +33,14 @@
 - 状态栏 (Bar) 歌词样式: 原文 / 中文翻译 / 原文+翻译 / 隐藏 (仅保留音乐图标)
 - 水平 Bar: 歌词过长时自动跑马灯滚动 (速度可调) 
 - 垂直 Bar (左右侧): 竖排歌词逐字显示，超长自动向上滚动 (速度可调) 
-- Popout 显示: 连接状态、歌曲信息 (歌名/作者/专辑独立行) 、专辑封面、波形进度条、歌词预览
-- Popout 右上角控制按钮: 上一曲 / 播放·暂停 / 下一曲
+- 详情页显示: 连接状态条 (可开关) 、歌曲信息 (歌名/作者/专辑独立行) 、专辑封面、波形进度条、歌词预览
+- 详情页控制按钮行 (进度条下方): 上一曲 / 播放·暂停 / 下一曲
+- 波形进度条播放动画可关闭 (桌面组件常驻时降低 CPU 占用) 
 - 无歌词时显示歌曲标题 (可关闭) 
-- SPlayer 进程未启动时自动隐藏 Bar 组件 (每 5 秒检测一次，可关闭，SPlayer 启动后自动恢复) 
+- SPlayer 进程未启动时自动隐藏组件 (每 5 秒检测一次，可关闭，SPlayer 启动后自动恢复) 
 - **MPRIS 自愈**: SPlayer/DMS 重启后自动重新激活 MPRIS 播放器，封面/控制/进度恢复 (无需手动操作) 
 - **控制回退**: MPRIS 不可用时播放/暂停/上下曲自动回退 SPlayer WebSocket `control` 命令
+- **桌面组件**: 与 Bar 插件同源 (共享逻辑与配置) ，完整复用详情页样式——歌曲卡片 (歌名/作者/专辑) 、波形进度条、封面 + 控制按钮、歌词三行列表 (逐字高亮/点击 seek) ，可自由缩放移动；支持独立自定义: 显示模式 (全部/仅播放器/仅歌词) 、强调色 (主色/辅色/自定义) 、背景透明度、显示器选择
 
 ## 安装
 
@@ -70,16 +73,29 @@
 
 ## 配置
 
-DMS 设置 → 插件 → DMS SPlayer Lyrics: 
+DMS 设置 → 插件 → DMS SPlayer Lyrics。设置分为**全局设置**（插件设置页，影响 Bar 与桌面组件通用行为）与**实例设置**（右键桌面组件 → 设置，仅影响该组件）:
+
+### 全局设置
+
+| 区块 | 设置项 | 说明 | 默认值 |
+|------|--------|------|--------|
+| SPlayer 连接 | 主机地址 | SPlayer WebSocket 服务地址 | `127.0.0.1` |
+| SPlayer 连接 | 端口 | SPlayer WebSocket 端口 | `25885` |
+| 通用 | SPlayer 未启动时自动隐藏 | SPlayer 进程未启动时隐藏 Bar 组件与桌面组件 (每 5 秒检测，启动后自动恢复) | 开 |
+| 通用 | 波形进度条动画 | 详情页/桌面组件波形进度条播放时波动动画 (桌面组件常驻时关闭可降低 CPU 占用) | 开 |
+| Bar 显示 | 无歌词时显示歌曲标题 | 无歌词时在 Bar 上显示歌曲标题 | 开 |
+| Bar 显示 | 详情页连接状态 | 详情页顶部显示连接状态条 (已连接/未连接) | 开 |
+| Bar 显示 | 状态栏歌词样式 | 原文 / 中文翻译 / 原文+翻译 / 隐藏 (仅保留音乐图标) | 原文 |
+| Bar 显示 | 歌词滚动速度 | 水平/垂直 Bar 歌词滚动速度 (px/帧，每 25ms 一帧，支持一位小数) | 2.5 |
+
+### 桌面组件实例设置 (右键组件 → 设置)
 
 | 设置项 | 说明 | 默认值 |
 |--------|------|--------|
-| 主机地址 | SPlayer WebSocket 地址 | `127.0.0.1` |
-| 端口 | SPlayer WebSocket 端口 | `25885` |
-| 状态栏歌词样式 | Bar 显示: 原文 / 中文翻译 / 原文+翻译 / 隐藏 (仅图标) | 原文 |
-| 歌词滚动速度 | 水平/垂直 Bar 歌词滚动速度 (px/帧，每 25ms 一帧，支持一位小数) | 2.5 |
-| 无歌词时显示歌曲标题 | 无歌词时 Bar 上显示歌曲名 | 开 |
-| SPlayer 未启动时自动隐藏 | SPlayer 进程未启动时隐藏 Bar 组件 | 开 |
+| 显示模式 | 全部显示 / 仅播放器 / 仅歌词 | 全部显示 |
+| 强调色 | 主色 / 辅色 / 自定义色 (弹窗选色或直接输入 `#RRGGBB` 后回车) | 主色 |
+| 背景透明度 | 组件背景不透明度 (0 = 全透明，100 = 不透明) | 60 |
+| 显示器选择 | 组件显示在哪个显示器 (仅实例设置可见) | 全部 |
 
 ## 架构
 
@@ -92,12 +108,16 @@ bridge/splayer_bridge.py    —— Python 客户端: 自动重连 (指数退避)
     ▼
 Quickshell Process + SplitParser("\n")   —— 读取 bridge 输出
     ▼
-LiveLyrics.qml              —— JSON 解析、事件分发、按 currentTime 查找当前歌词
-    ▲                                │
+LiveLyrics.qml / LiveLyricsCore.qml  —— JSON 解析、事件分发、按 currentTime 查找当前歌词
+    ▲                                │      (核心逻辑，Bar 与桌面组件共享同源实现)
     │ stdin 控制命令 (control)        ▼
-    └──────────────────────────────── Bar Pill / Popout —— 歌词显示 (三行歌词: 原文 / 翻译 / 罗马音、歌词预览) 
+    └──────────────────────────────── Bar Pill / 详情页 —— 歌词显示 (三行歌词: 原文 / 翻译 / 罗马音、歌词预览) 
     ▼
 MPRIS (可选)               —— 专辑封面、波形进度条、播放/暂停/上下曲控制、点击歌词 seek
+
+桌面组件 (LiveLyricsDesktop.qml) 通过 Loader 加载 LiveLyricsCore.qml 作为逻辑核心，
+UI 复用详情页样式，并支持实例级自定义 (显示模式/强调色/透明度/显示器) ；
+Bar 与桌面组件可同时运行 (SPlayer 支持多 WebSocket 连接) 。
 ```
 
 ## 调试
@@ -152,9 +172,11 @@ SPlayer WebSocket 协议 (实测确认) :
 
 ```
 plugins/livelyrics/
-├── plugin.json               # 插件清单 (widget 类型) 
-├── LiveLyrics.qml            # 主组件: bridge 生命周期、事件分发、歌词查找、UI
-├── LiveLyricsSettings.qml    # 设置页
+├── plugin.json               # 插件清单 (widget + desktop 双 surface)
+├── LiveLyrics.qml            # Bar 组件: bridge 生命周期、事件分发、歌词查找、UI
+├── LiveLyricsCore.qml        # 桌面组件逻辑核心: 与 LiveLyrics.qml 同源的解析/查找/控制逻辑
+├── LiveLyricsDesktop.qml     # 桌面组件: 内嵌 LiveLyricsCore.qml 逻辑核心 + 详情页样式 UI
+├── LiveLyricsSettings.qml    # 设置页 (全局 + 桌面组件实例设置)
 └── bridge/
     └── splayer_bridge.py     # Python WebSocket 客户端 → stdout JSON lines
 ```
