@@ -197,11 +197,21 @@ async def run(host, http_port, ws_port):
             # 初始化当前状态
             np = http_get(f"{base_url}/api/now-playing")
             if np:
-                emit({"type": "__event", "data": {"type": "song-info", "data": _now_playing_to_song_info(np)}})
                 track = np.get("track", {})
                 artists = track.get("artists", [])
                 artist_str = "/".join(a.get("name", "") for a in artists) if artists else ""
-                last_song_id = f"{track.get('title','')}|{artist_str}"
+                song_id = f"{track.get('title','')}|{artist_str}"
+
+                emit({"type": "__event", "data": {"type": "song-info", "data": _now_playing_to_song_info(np)}})
+
+                # 立即请求歌词（bridge 启动时歌曲可能已在播放，不会触发 song-change）
+                lyrics = http_get(f"{base_url}/api/lyrics")
+                if lyrics:
+                    lrc_data = _lyrics_to_lrc_data(lyrics)
+                    last_lyrics_hash = hashlib.md5(json.dumps(lrc_data, ensure_ascii=False).encode()).hexdigest()
+                    emit({"type": "__event", "data": {"type": "lyric-change", "data": {"lrcData": lrc_data}}})
+
+                last_song_id = song_id
                 last_playing = np.get("playing", False)
                 last_position = np.get("position", 0)
 
