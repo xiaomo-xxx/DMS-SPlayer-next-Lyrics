@@ -37,7 +37,7 @@ def http_get(url, timeout=3.0):
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    except Exception:
+    except Exception as e:
         return None
 
 
@@ -98,42 +98,77 @@ async def stdin_forwarder(host, http_port):
 
 
 def _now_playing_to_song_info(np):
+    """把 SPlayer-Next /api/now-playing 响应转为 SPlayer 桌面版 song-info 格式。"""
     track = np.get("track", {})
-    artwork = track.get("artwork")
-    cover = (artwork[0].get("src", "") if artwork else "") if isinstance(artwork, list) else ""
+    artists = track.get("artists", [])
+    artist_str = "/".join(a.get("name", "") for a in artists) if artists else ""
+
+    # 封面：优先 coverOriginal，其次 cover
+    cover = track.get("coverOriginal") or track.get("cover", "")
+
     return {
         "name": track.get("title", ""),
         "title": np.get("title", track.get("title", "")),
-        "artistName": track.get("artist", ""),
-        "artist": track.get("artist", ""),
-        "albumName": track.get("album", ""),
-        "album": track.get("album", ""),
+        "artistName": artist_str,
+        "artist": artist_str,
+        "albumName": (track.get("album") or {}).get("name", ""),
+        "album": (track.get("album") or {}).get("name", ""),
         "cover": cover,
-        "playStatus": np.get("state") == "playing",
+        "playStatus": np.get("playing", False),
         "currentTime": np.get("position", 0),
-        "duration": np.get("duration", 0),
+        "duration": track.get("duration", 0),
         "lyricAvailable": np.get("lyricAvailable", False),
         "lyricLineCount": np.get("lyricLineCount", 0),
     }
 
 
 def _lyrics_to_lrc_data(lyrics_resp):
-    """把 SPlayer-Next /api/lyrics 响应转为 lrcData 格式。"""
+    """把 SPlayer-Next /api/lyrics 响应转为 lrcData 格式（兼容 QML 歌词解析）。
+
+    SPlayer-Next lyrics 格式（实际）：
+    {
+      "lyric": [
+        {
+          "words": [{ "word": "字", "startTime": ms, "endTime": ms }],
+          "translatedLyric": "翻译文本",
+          "romanLyric": "罗马音文本",
+          "startTime": ms,
+          "endTime": ms,
+          "isBG": false,
+          "isDuet": false,
+          "language": "zh-CN"
+        },
+        ...
+      ]
+    }
+    """
+    raw_lines = lyrics_resp.get("lyric", [])
     lines = []
-    for item in lyrics_resp:
-        time_ms = item.get("time", 0)
-        text = item.get("word", "")
-        words = item.get("yrc", [])
+    for item in raw_lines:
+        words = item.get("words", [])
+        start_time = item.get("startTime", 0)
+        end_time = item.get("endTime", 0)
+
+        # 取第一行完整文本作为 text
+        if words:
+            text = "".join(w.get("word", "") for w in words)
+        else:
+            text = item.get("translatedLyric") or ""
+
         lines.append({
-            "startTime": time_ms,
-            "endTime": time_ms + 5000,
+            "startTime": start_time,
+            "endTime": end_time if end_time > 0 else start_time + 5000,
             "text": text,
             "lyric": text,
             "translated": item.get("translatedLyric", ""),
             "roman": item.get("romanLyric", ""),
             "words": [
-                {"startTime": w.get("startTime", 0), "endTime": w.get("endTime", 0), "word": w.get("word", "")}
-                for w in (words or [])
+                {
+                    "startTime": w.get("startTime", 0),
+                    "endTime": w.get("endTime", 0),
+                    "word": w.get("word", "")
+                }
+                for w in words
             ],
         })
     return lines
@@ -147,7 +182,7 @@ async def run(host, http_port, ws_port):
     last_song_id = None
     last_lyrics_hash = None
     last_position = 0
-    last_state = None
+    last_playing = None
 
     while True:
         try:
@@ -164,8 +199,10 @@ async def run(host, http_port, ws_port):
             if np:
                 emit({"type": "__event", "data": {"type": "song-info", "data": _now_playing_to_song_info(np)}})
                 track = np.get("track", {})
-                last_song_id = f"{track.get('title','')}|{track.get('artist','')}"
-                last_state = np.get("state")
+                artists = track.get("artists", [])
+                artist_str = "/".join(a.get("name", "") for a in artists) if artists else ""
+                last_song_id = f"{track.get('title','')}|{artist_str}"
+                last_playing = np.get("playing", False)
                 last_position = np.get("position", 0)
 
             while True:
@@ -175,37 +212,38 @@ async def run(host, http_port, ws_port):
                 if not np:
                     continue
 
-                state = np.get("state", "unknown")
-                position = np.get("position", 0)
-                duration = np.get("duration", 0)
                 track = np.get("track", {})
-                song_id = f"{track.get('title','')}|{track.get('artist','')}"
+                artists = track.get("artists", [])
+                artist_str = "/".join(a.get("name", "") for a in artists) if artists else ""
+
+                position = np.get("position", 0)
+                duration = track.get("duration", 0)
+                playing = np.get("playing", False)
+                song_id = f"{track.get('title','')}|{artist_str}"
 
                 # 歌曲切换
                 if song_id != last_song_id:
                     last_song_id = song_id
                     last_lyrics_hash = None
                     last_position = position
-                    last_state = state
+                    last_playing = playing
 
-                    artwork = track.get("artwork")
-                    cover = (artwork[0].get("src", "") if artwork else "") if isinstance(artwork, list) else ""
-
+                    cover = track.get("coverOriginal") or track.get("cover", "")
                     song_data = {
                         "title": track.get("title", ""),
                         "name": track.get("title", ""),
-                        "artist": track.get("artist", ""),
-                        "album": track.get("album", ""),
+                        "artist": artist_str,
+                        "album": (track.get("album") or {}).get("name", ""),
                         "cover": cover,
                         "duration": duration,
                         "currentTime": position,
-                        "playStatus": state == "playing",
+                        "playStatus": playing,
                     }
                     emit({"type": "__event", "data": {"type": "song-change", "data": song_data}})
                     emit({"type": "__event", "data": {"type": "song-info", "data": {
                         **song_data,
-                        "artistName": track.get("artist", ""),
-                        "albumName": track.get("album", ""),
+                        "artistName": artist_str,
+                        "albumName": (track.get("album") or {}).get("name", ""),
                     }}})
 
                     lyrics = http_get(f"{base_url}/api/lyrics")
@@ -217,9 +255,9 @@ async def run(host, http_port, ws_port):
                     continue
 
                 # 状态变化
-                if state != last_state:
-                    last_state = state
-                    emit({"type": "__event", "data": {"type": "status-change", "data": {"status": state == "playing"}}})
+                if playing != last_playing:
+                    last_playing = playing
+                    emit({"type": "__event", "data": {"type": "status-change", "data": {"status": playing}}})
 
                 # 进度变化
                 if abs(position - last_position) >= 200:
