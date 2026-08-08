@@ -1,46 +1,30 @@
 #!/usr/bin/env python3
 """
-splayer_bridge.py — SPlayer WebSocket → stdout JSON-lines bridge
-for the DMS SPlayer Lyrics plugin.
+splayer_bridge.py — SPlayer-Next HTTP polling → stdout JSON-lines bridge
+for the DMS SPlayer Lyrics plugin (fork of ayyyyano/DMS-SPlayer-Lyrics).
 
-架构：
-    SPlayer (ws://host:port)
-        │  WebSocket JSON events
-        ▼
-    splayer_bridge.py   (自动重连，指数退避)
-        │  stdout: 每行一个 JSON 对象
-        ▼
-    Quickshell Process + SplitParser("\\n")  →  QML 状态 → 歌词显示
-
-输出协议（stdout，一行一个 JSON，UTF-8）：
-    {"type": "__event", "data": <SPlayer 原始事件对象>}
-    {"type": "__status", "data": {"connected": true, "host": ..., "port": ...}}
-    {"type": "__status", "data": {"connected": false}}
-    {"type": "__error",  "data": {"message": "..."}}
-
-依赖：python3 + websockets 库（pip install websockets）
-用法：python3 splayer_bridge.py [host] [port]
+用法：python3 splayer_bridge.py [host] [http_port] [ws_port]
+    host:       SPlayer-Next 地址（默认 127.0.0.1）
+    http_port:  HTTP API 端口（默认 14558）
+    ws_port:    WebSocket 端口（默认 25885，兼容 QML 原配置，但本桥不再用）
 """
 
 import argparse
 import asyncio
 import json
 import sys
+import urllib.request
+import urllib.error
+import hashlib
 
-import websockets
+# 轮询间隔（毫秒）
+STATUS_POLL_INTERVAL_MS = 500
 
-# 多久没有收到任何消息就认为连接已死并重连（秒）。
-# SPlayer 播放时 progress-change 会周期性推送，暂停时也通常有状态事件，
-# 因此一段很长的静默几乎总是意味着连接异常。
-SILENCE_TIMEOUT = 120.0
-
-# 重连退避参数
 RETRY_MIN = 1.0
 RETRY_MAX = 30.0
 
 
 def emit(obj):
-    """向 stdout 输出一行 JSON 并立即 flush。"""
     print(json.dumps(obj, ensure_ascii=False), flush=True)
 
 
@@ -48,43 +32,30 @@ def log(msg):
     print(f"[splayer-bridge] {msg}", file=sys.stderr, flush=True)
 
 
-async def consume(ws):
-    """
-    读取一条消息并转发。返回 True 表示连接仍可用，False 表示连接已结束。
-    """
+def http_get(url, timeout=3.0):
     try:
-        raw = await asyncio.wait_for(ws.recv(), timeout=SILENCE_TIMEOUT)
-    except asyncio.TimeoutError:
-        # 静默超时：连接大概率已死，主动断开触发重连
-        log(f"{SILENCE_TIMEOUT:.0f}s 内无任何消息，判定连接失效")
-        return False
-    except websockets.ConnectionClosed:
-        return False
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
 
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", errors="replace")
 
+def http_post(url, data, timeout=3.0):
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        log(f"收到非 JSON 消息，忽略: {raw[:200]!r}")
-        return True
-
-    emit({"type": "__event", "data": payload})
-    return True
-
-
-# 当前 WebSocket 连接（供 stdin 转发使用）
-_ws = None
+        body = json.dumps(data).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": "application/json", "Accept": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
 
 
-async def stdin_forwarder():
-    """读取 stdin 中的 JSON 行，转发给 SPlayer（控制命令通道）。
-
-    QML 侧通过 Process.write() 发送，例如：
-        {"type": "control", "data": {"command": "toggle"}}
-        {"type": "get-song-info"}
-    """
+async def stdin_forwarder(host, http_port):
+    """读取 stdin 中的 JSON 行，转发给 SPlayer-Next（控制命令）。"""
     loop = asyncio.get_running_loop()
     while True:
         line = await loop.run_in_executor(None, sys.stdin.readline)
@@ -97,56 +68,170 @@ async def stdin_forwarder():
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
-            log(f"stdin 非 JSON，忽略: {line[:120]!r}")
             continue
-        ws = _ws
-        if ws is None:
-            log("stdin 命令已收到，但未连接 SPlayer，忽略")
-            continue
-        try:
-            await ws.send(json.dumps(payload))
-            log(f"已转发命令: {payload.get('type')}")
-        except websockets.WebSocketException as exc:
-            log(f"转发命令失败: {exc}")
+
+        op = payload.get("type") or payload.get("op", "")
+        data = payload.get("data", {})
+
+        if op == "control":
+            cmd = data.get("command", "")
+            url = f"http://{host}:{http_port}/api/"
+            if cmd == "toggle":
+                url += "play"
+            elif cmd in ("play", "pause", "stop", "next", "prev"):
+                url += cmd
+            elif cmd == "seek":
+                pos = data.get("positionMs")
+                if pos is not None:
+                    loop.run_in_executor(None, lambda p=pos: http_post(
+                        f"http://{host}:{http_port}/api/seek", {"positionMs": p}
+                    ))
+                continue
+            loop.run_in_executor(None, lambda u=url: http_post(u, {}))
+
+        elif op == "get-song-info":
+            np = loop.run_in_executor(None, lambda: http_get(
+                f"http://{host}:{http_port}/api/now-playing"
+            ))
+            if np:
+                emit({"type": "__event", "data": {"type": "song-info", "data": _now_playing_to_song_info(np)}})
 
 
-async def run(host, port):
-    global _ws
-    uri = f"ws://{host}:{port}"
+def _now_playing_to_song_info(np):
+    track = np.get("track", {})
+    artwork = track.get("artwork")
+    cover = (artwork[0].get("src", "") if artwork else "") if isinstance(artwork, list) else ""
+    return {
+        "name": track.get("title", ""),
+        "title": np.get("title", track.get("title", "")),
+        "artistName": track.get("artist", ""),
+        "artist": track.get("artist", ""),
+        "albumName": track.get("album", ""),
+        "album": track.get("album", ""),
+        "cover": cover,
+        "playStatus": np.get("state") == "playing",
+        "currentTime": np.get("position", 0),
+        "duration": np.get("duration", 0),
+        "lyricAvailable": np.get("lyricAvailable", False),
+        "lyricLineCount": np.get("lyricLineCount", 0),
+    }
+
+
+def _lyrics_to_lrc_data(lyrics_resp):
+    """把 SPlayer-Next /api/lyrics 响应转为 lrcData 格式。"""
+    lines = []
+    for item in lyrics_resp:
+        time_ms = item.get("time", 0)
+        text = item.get("word", "")
+        words = item.get("yrc", [])
+        lines.append({
+            "startTime": time_ms,
+            "endTime": time_ms + 5000,
+            "text": text,
+            "lyric": text,
+            "translated": item.get("translatedLyric", ""),
+            "roman": item.get("romanLyric", ""),
+            "words": [
+                {"startTime": w.get("startTime", 0), "endTime": w.get("endTime", 0), "word": w.get("word", "")}
+                for w in (words or [])
+            ],
+        })
+    return lines
+
+
+async def run(host, http_port, ws_port):
     delay = RETRY_MIN
+    base_url = f"http://{host}:{http_port}"
+    asyncio.get_running_loop().create_task(stdin_forwarder(host, http_port))
 
-    # 启动 stdin 转发任务
-    asyncio.get_running_loop().create_task(stdin_forwarder())
+    last_song_id = None
+    last_lyrics_hash = None
+    last_position = 0
+    last_state = None
 
     while True:
         try:
-            log(f"正在连接 {uri} …")
-            # ping_interval=None: 不发送应用层 ping，
-            # 避免 SPlayer 不响应协议 ping 时被误判断线。
-            async with websockets.connect(uri, ping_interval=None) as ws:
-                _ws = ws
-                log("已连接")
-                delay = RETRY_MIN
-                emit({
-                    "type": "__status",
-                    "data": {"connected": True, "host": host, "port": port},
-                })
+            info = http_get(f"{base_url}/api/info", timeout=3)
+            if info is None:
+                raise Exception("无法连接到 SPlayer-Next HTTP API")
 
-                # 连接成功后主动请求当前状态（SPlayer 不重放事件，
-                # 重启 DMS/bridge 后需靠此恢复歌曲信息与进度）
-                try:
-                    await ws.send(json.dumps({"type": "get-song-info"}))
-                    log("已发送 get-song-info")
-                except websockets.WebSocketException as exc:
-                    log(f"发送 get-song-info 失败: {exc}")
+            log(f"已连接 {host}:{http_port}")
+            delay = RETRY_MIN
+            emit({"type": "__status", "data": {"connected": True, "host": host, "httpPort": http_port, "wsPort": ws_port}})
 
-                while await consume(ws):
-                    pass
-                log("连接已断开")
-        except (websockets.WebSocketException, OSError) as exc:
+            # 初始化当前状态
+            np = http_get(f"{base_url}/api/now-playing")
+            if np:
+                emit({"type": "__event", "data": {"type": "song-info", "data": _now_playing_to_song_info(np)}})
+                track = np.get("track", {})
+                last_song_id = f"{track.get('title','')}|{track.get('artist','')}"
+                last_state = np.get("state")
+                last_position = np.get("position", 0)
+
+            while True:
+                await asyncio.sleep(STATUS_POLL_INTERVAL_MS / 1000.0)
+
+                np = http_get(f"{base_url}/api/now-playing")
+                if not np:
+                    continue
+
+                state = np.get("state", "unknown")
+                position = np.get("position", 0)
+                duration = np.get("duration", 0)
+                track = np.get("track", {})
+                song_id = f"{track.get('title','')}|{track.get('artist','')}"
+
+                # 歌曲切换
+                if song_id != last_song_id:
+                    last_song_id = song_id
+                    last_lyrics_hash = None
+                    last_position = position
+                    last_state = state
+
+                    artwork = track.get("artwork")
+                    cover = (artwork[0].get("src", "") if artwork else "") if isinstance(artwork, list) else ""
+
+                    song_data = {
+                        "title": track.get("title", ""),
+                        "name": track.get("title", ""),
+                        "artist": track.get("artist", ""),
+                        "album": track.get("album", ""),
+                        "cover": cover,
+                        "duration": duration,
+                        "currentTime": position,
+                        "playStatus": state == "playing",
+                    }
+                    emit({"type": "__event", "data": {"type": "song-change", "data": song_data}})
+                    emit({"type": "__event", "data": {"type": "song-info", "data": {
+                        **song_data,
+                        "artistName": track.get("artist", ""),
+                        "albumName": track.get("album", ""),
+                    }}})
+
+                    lyrics = http_get(f"{base_url}/api/lyrics")
+                    if lyrics:
+                        lrc_data = _lyrics_to_lrc_data(lyrics)
+                        h = hashlib.md5(json.dumps(lrc_data, ensure_ascii=False).encode()).hexdigest()
+                        last_lyrics_hash = h
+                        emit({"type": "__event", "data": {"type": "lyric-change", "data": {"lrcData": lrc_data}}})
+                    continue
+
+                # 状态变化
+                if state != last_state:
+                    last_state = state
+                    emit({"type": "__event", "data": {"type": "status-change", "data": {"status": state == "playing"}}})
+
+                # 进度变化
+                if abs(position - last_position) >= 200:
+                    last_position = position
+                    emit({"type": "__event", "data": {"type": "progress-change", "data": {
+                        "currentTime": position,
+                        "duration": duration,
+                    }}})
+
+        except Exception as exc:
             log(f"连接失败: {exc}")
 
-        _ws = None
         emit({"type": "__status", "data": {"connected": False}})
         log(f"{delay:.0f}s 后重连…")
         await asyncio.sleep(delay)
@@ -154,15 +239,14 @@ async def run(host, port):
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="SPlayer WebSocket bridge for DMS SPlayer Lyrics"
-    )
+    ap = argparse.ArgumentParser(description="SPlayer-Next HTTP bridge for DMS SPlayer Lyrics")
     ap.add_argument("host", nargs="?", default="127.0.0.1")
-    ap.add_argument("port", nargs="?", default="25885", type=int)
+    ap.add_argument("http_port", nargs="?", default="14558", type=int)
+    ap.add_argument("ws_port", nargs="?", default="25885", type=int)
     args = ap.parse_args()
 
     try:
-        asyncio.run(run(args.host, args.port))
+        asyncio.run(run(args.host, args.http_port, args.ws_port))
     except KeyboardInterrupt:
         pass
 
