@@ -149,11 +149,16 @@ def _lyrics_to_lrc_data(lyrics_resp):
         start_time = item.get("startTime", 0)
         end_time = item.get("endTime", 0)
 
-        # 取第一行完整文本作为 text
+        # isBG=true 表示非人声/纯音乐，跳过不显示
+        is_bg = item.get("isBG", False)
+
+        # 取可显示文本：优先用 words 连起来，其次用 translatedLyric
         if words:
             text = "".join(w.get("word", "") for w in words)
+        elif item.get("translatedLyric"):
+            text = item.get("translatedLyric", "")
         else:
-            text = item.get("translatedLyric") or ""
+            text = ""
 
         lines.append({
             "startTime": start_time,
@@ -170,8 +175,10 @@ def _lyrics_to_lrc_data(lyrics_resp):
                 }
                 for w in words
             ],
+            "isBG": is_bg,
         })
-    return lines
+    # 过滤掉纯音乐行（isBG=True 且无翻译）
+    return [l for l in lines if not l["isBG"]]
 
 
 async def run(host, http_port, ws_port):
