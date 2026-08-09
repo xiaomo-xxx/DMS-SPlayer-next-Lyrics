@@ -23,7 +23,7 @@
 
 ## 特性
 
-- 连接 SPlayer WebSocket (默认 `127.0.0.1:25885`) ，自动重连
+- 连接 SPlayer WebSocket (默认 `127.0.0.1:14558`) ，自动重连
 - 处理 `song-change` / `lyric-change` / `progress-change` / `status-change`
 - 根据播放进度自动高亮当前歌词行 (播放中本地平滑推进，切换流畅)  
 - 详情页歌词列表三行显示: 原文 (大) → 中文翻译 (较小) → 罗马音 (最小斜体) 
@@ -41,13 +41,17 @@
 - **MPRIS 自愈**: SPlayer/DMS 重启后自动重新激活 MPRIS 播放器，封面/控制/进度恢复 (无需手动操作) 
 - **控制回退**: MPRIS 不可用时播放/暂停/上下曲自动回退 SPlayer WebSocket `control` 命令
 - **桌面组件**: 与 Bar 插件同源 (共享逻辑与配置) ，完整复用详情页样式——歌曲卡片 (歌名/作者/专辑) 、波形进度条、封面 + 控制按钮、歌词三行列表 (逐字高亮/点击 seek) ，可自由缩放移动；支持独立自定义: 显示模式 (全部/仅播放器/仅歌词) 、强调色 (主色/辅色/自定义) 、背景透明度、显示器选择
+- **看门狗**: bridge 卡死 12 秒自动重启 (心跳每 2 秒上报) ，歌词组件自愈，无需手动干预
+- **异步 HTTP**: bridge 内所有 HTTP 请求在线程池执行，SPlayer API 慢响应不会阻塞事件循环与心跳
+- **换歌歌词就绪重试**: 换歌时校验 trackId 防止串歌，歌词未就绪时自动重试拉取，切歌后约 1 秒内显示歌词
+- **进度防抖**: 播放进度本地平滑推进，服务器时间与本地偏差 1 秒内保持本地不回退，避免歌词高亮抖动
 
 ## 安装
 
 1. 将插件目录复制到 DMS 插件目录 (目录名必须是 `livelyrics`，插件内部依赖该路径定位 bridge 脚本) : 
 
    ```bash
-   git clone https://github.com/ayyyyano/DMS-SPlayer-Lyrics.git ~/.config/DankMaterialShell/plugins/livelyrics
+   git clone https://github.com/xiaomo-xxx/DMS-SPlayer-next-Lyrics.git ~/.config/DankMaterialShell/plugins/livelyrics
    # 或手动复制: 
    # cp -r <本目录> ~/.config/DankMaterialShell/plugins/livelyrics
    ```
@@ -69,7 +73,7 @@
    dms restart
    ```
 
-6. 确认 SPlayer 已启动，且在 SPlayer 设置 → 网络与连接 中启用 WebSocket (WebSocket 服务默认监听 `127.0.0.1:25885`)。
+6. 确认 SPlayer 已启动，且在 SPlayer 设置 → 网络与连接 中启用 WebSocket (WebSocket 服务默认监听 `127.0.0.1:14558`)。
 
 ## 配置
 
@@ -80,7 +84,7 @@ DMS 设置 → 插件 → DMS SPlayer Lyrics。设置分为**全局设置**（�
 | 区块 | 设置项 | 说明 | 默认值 |
 |------|--------|------|--------|
 | SPlayer 连接 | 主机地址 | SPlayer WebSocket 服务地址 | `127.0.0.1` |
-| SPlayer 连接 | 端口 | SPlayer WebSocket 端口 | `25885` |
+| SPlayer 连接 | 端口 | SPlayer WebSocket 端口 | `14558` |
 | 通用 | SPlayer 未启动时自动隐藏 | SPlayer 进程未启动时隐藏 Bar 组件与桌面组件 (每 5 秒检测，启动后自动恢复) | 开 |
 | 通用 | 波形进度条动画 | 详情页/桌面组件波形进度条播放时波动动画 (桌面组件常驻时关闭可降低 CPU 占用) | 开 |
 | Bar 显示 | 无歌词时显示歌曲标题 | 无歌词时在 Bar 上显示歌曲标题 | 开 |
@@ -100,10 +104,10 @@ DMS 设置 → 插件 → DMS SPlayer Lyrics。设置分为**全局设置**（�
 ## 架构
 
 ```
-SPlayer (ws://127.0.0.1:25885)
+SPlayer (ws://127.0.0.1:14558)
     │  WebSocket JSON events (song-change / lyric-change / progress-change / status-change) 
     ▼
-bridge/splayer_bridge.py    —— Python 客户端: 自动重连 (指数退避) ，
+bridge/splayer_bridge.py    —— Python 客户端: 自动重连 (指数退避) ，每 2 秒输出心跳 (__heartbeat)，
     │                          stdout 每行输出一个 JSON
     ▼
 Quickshell Process + SplitParser("\n")   —— 读取 bridge 输出
@@ -132,7 +136,7 @@ journalctl --user -u dankmaterialshell -f | grep -i livelyrics
  dms ipc call plugin-scan status liveLyrics
 
 # 单独测试 bridge (不经过 DMS)  : 
-python3 ~/.config/DankMaterialShell/plugins/livelyrics/bridge/splayer_bridge.py 127.0.0.1 25885
+python3 ~/.config/DankMaterialShell/plugins/livelyrics/bridge/splayer_bridge.py 127.0.0.1 14558
 # 正常输出应为每行一个 JSON，例如: 
 # {"type": "__status", "data": {"connected": true, ...}}
 # {"type": "__event", "data": {"type": "song-change", ...}}
@@ -162,8 +166,10 @@ SPlayer WebSocket 协议 (实测确认) :
 
 - **Bar 上的歌词组件完全消失 (不是显示「未连接」)**: 正常行为——插件每 5 秒检测一次 SPlayer 进程。
 - **SPlayer 进程未启动时组件自动隐藏**。启动 SPlayer 后最多 5 秒内组件自动恢复。可在插件设置中关闭「SPlayer 未启动时自动隐藏」开关（DMS 设置 → 插件 → DMS SPlayer Lyrics）。
-- **Bar 上显示「SPlayer 未连接」**: 说明 SPlayer 进程在运行但 WebSocket 尚未就绪 (或端口设置错误)。确认 SPlayer 设置 → 网络与连接 已启用 WebSocket (默认 `127.0.0.1:25885`)；bridge 会自动重连，无需重启 DMS。
+- **Bar 上显示「SPlayer 未连接」**: 说明 SPlayer 进程在运行但 WebSocket 尚未就绪 (或端口设置错误)。确认 SPlayer 设置 → 网络与连接 已启用 WebSocket (默认 `127.0.0.1:14558`)；bridge 会自动重连，无需重启 DMS。
 - **歌词一直显示「等待歌词」**: 多为首次连接尚未收到 `lyric-change`；连接后插件会主动 `get-song-info` 恢复歌词，重启 DMS 后无需等切歌。
+- **歌词周期性抽搐 (整段闪没/进度跳动)**: 旧版本 QML 用 `int` 属性存毫秒时间戳导致溢出，看门狗误判 bridge 卡死并反复重启，表现就是周期性闪没；已修复 (改用 `var`)，更新到最新版即可。若仍出现，用 `journalctl --user -u dankmaterialshell -f | grep -i livelyrics` 确认 bridge 是否有反复 SIGTERM 日志。
+- **换歌后歌词空白**: 已内置歌词就绪重试 (换歌校验 trackId 防串歌，未就绪自动补拉) ；切歌后约 1 秒内应显示歌词，若长时间空白，确认 SPlayer 侧歌词接口正常。
 - **点击歌词行不跳转**: 需要 MPRIS 支持 seek (绝大多数播放器支持)；MPRIS 不可用时提示不支持 (SPlayer 协议无 seek 命令)。
 - **详情页无专辑封面/波形**: 插件从 MPRIS 获取封面与进度，确认 SPlayer 已通过 MPRIS 注册 (DMS 媒体控件能显示即可)；MPRIS 失效时自动回退 WebSocket 模式。
 - **建议设置 SPlayer 开机自启**: 防止可能的不必要空间占用与重连等待。
