@@ -47,8 +47,8 @@ Item {
     property int currentLineIndex: -1
     property int currentWordIndex: -1
 
-    property int _lastReportedTime: 0
-    property int _lastProgressAt: 0
+    property var _lastReportedTime: 0
+    property var _lastProgressAt: 0
     property int _restartDelay: 0
 
     // ── bridge 脚本路径（与 LiveLyrics.qml 相同约定）──
@@ -275,10 +275,24 @@ Item {
     }
 
     function _onProgressChange(d) {
-        if (typeof d.currentTime === "number" && d.currentTime >= 0)
-            root.currentTime = d.currentTime
         if (d.duration > 0)
             root.currentDuration = d.duration
+        var serverTime = typeof d.currentTime === "number" ? d.currentTime : -1
+        if (serverTime >= 0) {
+            if (root.isPlaying && root._lastProgressAt > 0) {
+                // 播放中：本地 positionTicker 平滑推进，服务器轮询值可能略落后。
+                // 偏差在 1s 内保持本地推进值，避免时间小幅"回退"导致歌词行抖动；
+                // 偏差 > 1s 视为 seek/拖动，才校正。
+                var drift = serverTime - root.currentTime
+                if (drift >= -1000 && drift <= 1000) {
+                    root._lastReportedTime = root.currentTime
+                    root._lastProgressAt = Date.now()
+                    root._updateCurrentLine()
+                    return
+                }
+            }
+            root.currentTime = serverTime
+        }
         if (root.isPlaying) {
             root._lastReportedTime = root.currentTime
             root._lastProgressAt = Date.now()

@@ -13,10 +13,23 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 import urllib.request
 import urllib.error
 import hashlib
+import hashlib
+import os
+import signal
+import traceback
 
+TRACE_LOG = "/tmp/splayer_bridge_trace.log"
+
+def _trace(msg):
+    try:
+        with open(TRACE_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] pid={os.getpid()} {msg}\n")
+    except Exception:
+        pass
 # 轮询间隔（毫秒）
 STATUS_POLL_INTERVAL_MS = 500
 
@@ -52,6 +65,28 @@ def http_post(url, data, timeout=3.0):
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
+
+
+async def heartbeat_loop(interval=2.0):
+    """看门狗心跳：只要进程活着就每 interval 秒 emit 一条 __heartbeat。
+
+    QML 侧用「连续 N 秒无任何输出」判定 bridge 卡死（如内部轮询死循环），
+    所以即使 SPlayer 未连接 / 暂停播放 / 重连退避期间也必须持续发心跳。
+    """
+    while True:
+        await asyncio.sleep(interval)
+        emit({"type": "__heartbeat", "data": {"ts": int(time.time() * 1000)}})
+
+
+async def http_get_async(url, timeout=3.0):
+    """同步 http_get 的非阻塞包装：在线程池执行，避免阻塞 asyncio 事件循环。
+
+    关键：SPlayer API 慢响应/超时时，若直接同步调用会卡住整个事件循环，
+    连带 heartbeat 断流，QML 看门狗会误判 bridge 卡死并强制重启
+    （表现为歌词界面周期性"抽搐"）。
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, http_get, url, timeout)
 
 
 async def stdin_forwarder(host, http_port):
@@ -185,6 +220,7 @@ async def run(host, http_port, ws_port):
     delay = RETRY_MIN
     base_url = f"http://{host}:{http_port}"
     asyncio.get_running_loop().create_task(stdin_forwarder(host, http_port))
+    asyncio.get_running_loop().create_task(heartbeat_loop())
 
     last_song_id = None
     last_lyrics_hash = None
@@ -193,7 +229,7 @@ async def run(host, http_port, ws_port):
 
     while True:
         try:
-            info = http_get(f"{base_url}/api/info", timeout=3)
+            info = await http_get_async(f"{base_url}/api/info", timeout=3)
             if info is None:
                 raise Exception("无法连接到 SPlayer-Next HTTP API")
 
@@ -202,7 +238,7 @@ async def run(host, http_port, ws_port):
             emit({"type": "__status", "data": {"connected": True, "host": host, "httpPort": http_port, "wsPort": ws_port}})
 
             # 初始化当前状态
-            np = http_get(f"{base_url}/api/now-playing")
+            np = await http_get_async(f"{base_url}/api/now-playing")
             if np:
                 track = np.get("track", {})
                 artists = track.get("artists", [])
@@ -212,7 +248,7 @@ async def run(host, http_port, ws_port):
                 emit({"type": "__event", "data": {"type": "song-info", "data": _now_playing_to_song_info(np)}})
 
                 # 立即请求歌词（bridge 启动时歌曲可能已在播放，不会触发 song-change）
-                lyrics = http_get(f"{base_url}/api/lyrics")
+                lyrics = await http_get_async(f"{base_url}/api/lyrics")
                 if lyrics:
                     lrc_data = _lyrics_to_lrc_data(lyrics)
                     last_lyrics_hash = hashlib.md5(json.dumps(lrc_data, ensure_ascii=False).encode()).hexdigest()
@@ -225,7 +261,7 @@ async def run(host, http_port, ws_port):
             while True:
                 await asyncio.sleep(STATUS_POLL_INTERVAL_MS / 1000.0)
 
-                np = http_get(f"{base_url}/api/now-playing")
+                np = await http_get_async(f"{base_url}/api/now-playing")
                 if not np:
                     continue
 
@@ -263,13 +299,28 @@ async def run(host, http_port, ws_port):
                         "albumName": (track.get("album") or {}).get("name", ""),
                     }}})
 
-                    lyrics = http_get(f"{base_url}/api/lyrics")
-                    if lyrics:
+                    # 换歌后立即尝试拉歌词；SPlayer 换歌瞬间歌词可能还没就绪
+                    # （返回空 lyric 或仍是上一首的 trackId），此时保持
+                    # last_lyrics_hash=None，由下方「歌词就绪重试」在后续轮询中补拉。
+                    track_id = str(track.get("id", ""))
+                    lyrics = await http_get_async(f"{base_url}/api/lyrics")
+                    if lyrics and str(lyrics.get("trackId", "")) == track_id:
                         lrc_data = _lyrics_to_lrc_data(lyrics)
-                        h = hashlib.md5(json.dumps(lrc_data, ensure_ascii=False).encode()).hexdigest()
-                        last_lyrics_hash = h
-                        emit({"type": "__event", "data": {"type": "lyric-change", "data": {"lrcData": lrc_data}}})
+                        if lrc_data:
+                            last_lyrics_hash = hashlib.md5(json.dumps(lrc_data, ensure_ascii=False).encode()).hexdigest()
+                            emit({"type": "__event", "data": {"type": "lyric-change", "data": {"lrcData": lrc_data}}})
                     continue
+
+                # 歌词就绪重试：换歌后 SPlayer 歌词未就绪（空/旧 trackId）时，
+                # 每轮轮询补拉一次，直到拿到当前歌的歌词。已拿到则不再请求。
+                if last_lyrics_hash is None:
+                    track_id = str(track.get("id", ""))
+                    lyrics = await http_get_async(f"{base_url}/api/lyrics")
+                    if lyrics and str(lyrics.get("trackId", "")) == track_id:
+                        lrc_data = _lyrics_to_lrc_data(lyrics)
+                        if lrc_data:
+                            last_lyrics_hash = hashlib.md5(json.dumps(lrc_data, ensure_ascii=False).encode()).hexdigest()
+                            emit({"type": "__event", "data": {"type": "lyric-change", "data": {"lrcData": lrc_data}}})
 
                 # 状态变化
                 if playing != last_playing:
@@ -294,16 +345,31 @@ async def run(host, http_port, ws_port):
 
 
 def main():
+    _trace("启动")
     ap = argparse.ArgumentParser(description="SPlayer-Next HTTP bridge for DMS SPlayer Lyrics")
     ap.add_argument("host", nargs="?", default="127.0.0.1")
     ap.add_argument("http_port", nargs="?", default="14558", type=int)
     ap.add_argument("ws_port", nargs="?", default="25885", type=int)
     args = ap.parse_args()
 
+    def _on_term(signum, frame):
+        _trace(f"收到信号 {signum} ({signal.Signals(signum).name})")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, _on_term)
+
     try:
         asyncio.run(run(args.host, args.http_port, args.ws_port))
+    except SystemExit:
+        pass
     except KeyboardInterrupt:
         pass
+    except Exception:
+        _trace("未捕获异常退出: " + traceback.format_exc())
+        raise
+    finally:
+        _trace("退出")
 
 
 if __name__ == "__main__":

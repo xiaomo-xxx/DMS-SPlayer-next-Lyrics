@@ -82,7 +82,7 @@ PluginComponent {
     //   - 开启：visibilityCommand 非空 → 立即检查；visibilityInterval>0 → 定时轮询
     //   - 关闭：visibilityCommand 置空 → 强制显示；visibilityInterval=0 → 停止轮询
     // ─────────────────────────────────────────────────────────────────────
-    visibilityCommand: root.headless ? "" : (root.autoHideWhenClosed ? "pgrep -x SPlayer" : "")
+    visibilityCommand: root.headless ? "" : (root.autoHideWhenClosed ? "pgrep -f SPlayer-Next" : "")
     visibilityInterval: root.headless ? 0 : (root.autoHideWhenClosed ? 5 : 0)
 
     // ─────────────────────────────────────────────────────────────────────
@@ -107,7 +107,7 @@ PluginComponent {
 
     // 本地进度平滑用的时间戳
     property int _lastReportedTime: 0
-    property int _lastProgressAt: 0
+    property var _lastProgressAt: 0
 
     // ─────────────────────────────────────────────────────────────────────
     // bridge 进程管理
@@ -133,6 +133,12 @@ PluginComponent {
 
     property string bridgeScript: _bridgeScriptPath()
     property int _restartDelay: 0          // 崩溃退避（秒）
+    property var _lastBridgeActivity: 0    // 最近一次收到 bridge 输出的时间戳（Date.now()，用 var 防 32 位溢出）
+    property int _watchdogTimeoutMs: 12000 // 超过该时长无任何输出 → 判定 bridge 卡死
+
+    function _dbg(msg) {
+        Quickshell.execDetached(["sh", "-c", "echo '" + msg.replace(/'/g, "'\\''") + "' >> /tmp/qml_debug.log"])
+    }
 
     Process {
         id: bridgeProcess
@@ -151,8 +157,13 @@ PluginComponent {
                     console.warn("[LiveLyrics][bridge] " + line)
             }
         }
-        onStarted: console.info("[LiveLyrics] bridge 已启动 (pid " + processId + ")")
+        onStarted: {
+            console.info("[LiveLyrics] bridge 已启动 (pid " + processId + ")")
+            root._dbg("onStarted pid=" + processId + " t=" + Date.now())
+            root._lastBridgeActivity = Date.now()
+        }
         onExited: (exitCode, exitStatus) => {
+            root._dbg("onExited code=" + exitCode + " status=" + exitStatus + " t=" + Date.now())
             root.connected = false
             console.warn("[LiveLyrics] bridge 退出 (code " + exitCode + ")，"
                          + root._restartDelay + "s 后重启")
@@ -205,10 +216,36 @@ PluginComponent {
     onSplayerPortChanged: _restartBridge()
 
     function _restartBridge() {
+        root._dbg("_restartBridge t=" + Date.now() + " host=" + root.splayerHost + " port=" + root.splayerPort)
         root._restartDelay = 0
         bridgeRestartTimer.stop()
         bridgeProcess.running = false
         bridgeProcess.running = true
+    }
+
+    function _forceRestartBridge(reason) {
+        root._dbg("_forceRestartBridge reason=" + reason + " t=" + Date.now())
+        console.warn("[LiveLyrics][watchdog] " + reason
+                     + "，强制重启 bridge")
+        root._lastBridgeActivity = Date.now()   // 防止重启瞬间误判
+        root._restartDelay = 0
+        bridgeRestartTimer.stop()
+        bridgeProcess.running = false
+        bridgeProcess.running = true
+    }
+
+    Timer {
+        id: bridgeWatchdogTimer
+        interval: 5000
+        repeat: true
+        running: root._bridgeWanted && bridgeProcess.running
+        onTriggered: {
+            var silentFor = Date.now() - root._lastBridgeActivity
+            if (silentFor > root._watchdogTimeoutMs) {
+                root._forceRestartBridge("bridge 已 " + (silentFor / 1000).toFixed(0)
+                                        + "s 无输出")
+            }
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -216,6 +253,7 @@ PluginComponent {
     // ─────────────────────────────────────────────────────────────────────
 
     function _onBridgeLine(rawLine) {
+        root._lastBridgeActivity = Date.now()   // 任何输出都算活动
         var line = (rawLine || "").trim()
         if (line === "")
             return
@@ -598,7 +636,7 @@ PluginComponent {
     //
     // 性能：遍历 Mpris.players 会触发 D-Bus 属性拉取（含大 Metadata），
     // 常驻 3s 一次 × 双实例 = 持续负载 → 健康时降频到 30s，失效时 3s 快速恢复
-    property int _lastMprisActivateAt: 0
+    property var _lastMprisActivateAt: 0
     Timer {
         id: mprisHealthTimer
         interval: root.mprisUsable ? 30000 : 3000
